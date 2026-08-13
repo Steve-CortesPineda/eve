@@ -1,0 +1,63 @@
+# Eve configuration.
+#
+# KEY=value, one per line. '#' starts a comment. An environment variable of the
+# same name wins over the value here.
+#
+# This file is PARSED, key by key, never sourced. A key Eve does not recognise
+# is ignored, and a stray line cannot execute anything. That also means a typo
+# is silent, so if a setting is not taking effect, ask the program rather than
+# the file:
+#
+#   eve-doctor            prints every value as the scripts actually resolve it
+#
+# EVE_HOME is deliberately absent: a config file cannot tell you where the
+# config file lives. Set it in the environment or pass --eve-home.
+
+# ---------------------------------------------------------------- kill switch
+# 1 makes every hook exit immediately, at a cost of a few milliseconds per
+# prompt. Nothing else changes and no memory is touched. `eve off` sets this.
+EVE_DISABLE=0
+
+# ------------------------------------------------------------------- recall
+# How many memories one prompt may inject.
+EVE_RECALL_LIMIT=3
+
+# Hard ceiling on the injected block, in characters. Whole lines are dropped to
+# stay under it; the block is never cut mid-sentence, and a budget too small for
+# any memory produces silence rather than an empty wrapper.
+EVE_RECALL_MAX_CHARS=1200
+
+# Prompts shorter than this are not searched. "go", "yes", "do it" carry no
+# query terms.
+EVE_RECALL_MIN_PROMPT=12
+
+# ---------------------------------------------------------------- retrieval
+# Characters of the claim line shown per hit.
+EVE_SNIPPET_CHARS=150
+
+# Maximum files the grep prefilter may hand to the scorer.
+EVE_CANDIDATE_CAP=300
+
+# Lines read per memory file. A memory should be far shorter than this; the cap
+# exists so one pasted log file cannot slow down every prompt.
+EVE_MAX_LINES=400
+
+# The relevance gate. A candidate scoring below this is not shown at all.
+# Raise it if recall is noisy, lower it if the store is quiet. See what the
+# scores actually are before changing it:
+#   eve search --query "your prompt" --all
+EVE_MIN_SCORE=6
+
+# ------------------------------------------------------------- session start
+# Ceiling on the standing block printed when a session opens.
+EVE_BRIEF_MAX_CHARS=800
+
+# ------------------------------------------------------------------- engine
+# awk is the only engine that ships. The key exists so a future engine is a
+# config change rather than a fork.
+EVE_ENGINE=awk
+
+# -------------------------------------------------------------------- debug
+# 1 appends one line per recall to state/recall.log. The log is bounded, so
+# leaving it on cannot fill a disk.
+EVE_DEBUG=0

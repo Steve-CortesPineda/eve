@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "Answer key for the reference answerer. This is the harness's own fixture:",
+    "it encodes what a correct, grounded, appropriately-hedged answer looks like",
+    "for each question. Keys are question ids from ../questions.json.",
+    "",
+    "If you change a question, change its entry here too, or the reference run",
+    "stops being green and CI will tell you."
+  ],
+
+  "ANS-01": {
+    "abstain": false,
+    "answer": "The upstream request timeout is 8 seconds. A request with no upstream headers by then is cut and the caller gets a gateway timeout.",
+    "citations": ["services/vireo-gateway.md#request-timeout"]
+  },
+  "ANS-02": {
+    "abstain": false,
+    "answer": "The index is split across 12 shards, assigned by a hash of the document id.",
+    "citations": ["services/hoopoe-indexer.md#shards"]
+  },
+  "ANS-03": {
+    "abstain": false,
+    "answer": "Two measured reasons. The rebuild had grown past the maintenance window, so it was still running when morning traffic arrived. And the incremental path had caught up: a month of diffs between the incrementally-updated index and a rebuilt one found nothing that mattered, so the rebuild was correcting no drift.",
+    "citations": ["decisions/2029-11-02-drop-nightly-rebuild.md#why"]
+  },
+  "ANS-04": {
+    "abstain": false,
+    "answer": "The rotation hands over on Thursday at 10:00 local time, chosen so the outgoing on-call is still around for two working days afterwards.",
+    "citations": ["notes/2030-02-03-oncall-rotation.md#handoff"]
+  },
+  "ANS-05": {
+    "abstain": false,
+    "answer": "A full rebuild across all shards took 3 hours 20 minutes, measured 2031-05-20 on a clean run with shards rebuilt in parallel. Expect longer under live traffic.",
+    "citations": ["notes/2031-05-20-indexer-rebuild-runbook.md#measured-wall-time"]
+  },
+  "ANS-06": {
+    "abstain": false,
+    "answer": "It put every external request through vireo-gateway as the single edge, and retired the per-service edge configuration that three services had each implemented slightly differently.",
+    "citations": ["decisions/2030-04-18-adopt-vireo-gateway.md#decision"]
+  },
+  "ANS-07": {
+    "abstain": false,
+    "answer": "hoopoe-indexer. It builds and serves the search index. marmot-scheduler runs the rebuild job but does not own the index.",
+    "citations": ["services/hoopoe-indexer.md"]
+  },
+
+  "ABS-01": {
+    "abstain": true,
+    "answer": "Not recorded. The knowledge base says shard metadata is written alongside the index itself rather than in a separate store, and it never names a datastore. I am not going to guess one.",
+    "citations": ["services/hoopoe-indexer.md#shards"]
+  },
+  "ABS-02": {
+    "abstain": true,
+    "answer": "No approver is recorded. The decision record documents the change and the reasoning but names nobody, and the knowledge base does not identify people anywhere.",
+    "citations": ["decisions/2030-09-30-queue-backend-switch.md#decision"]
+  },
+  "ABS-03": {
+    "abstain": true,
+    "answer": "Not recorded anywhere. The gateway file states an 8 second upstream timeout, which is a different thing, and says explicitly that latency targets, error budgets and alerting thresholds are not written down.",
+    "citations": ["services/vireo-gateway.md#what-is-not-here"]
+  },
+  "ABS-04": {
+    "abstain": true,
+    "answer": "The numbers are not recorded. The mechanism is: retry with exponential backoff, then dead-letter once retries are exhausted. The interval, multiplier and ceiling are set per job class in deployment config and were never written into the knowledge base.",
+    "citations": ["services/marmot-scheduler.md#retries"]
+  },
+  "ABS-05": {
+    "abstain": true,
+    "answer": "Not tracked. The migration record states outright that effort and cost were not measured and are not recorded anywhere.",
+    "citations": ["decisions/2030-09-30-queue-backend-switch.md#migration"]
+  },
+  "ABS-06": {
+    "abstain": true,
+    "answer": "The tool is not recorded. The escalation order is documented — next person on the rotation list, then the one after — but which tool pages, and on what timer, is explicitly not written down.",
+    "citations": ["notes/2030-02-03-oncall-rotation.md#escalation"]
+  },
+  "ABS-07": {
+    "abstain": true,
+    "answer": "Not recorded. A standby pool is mentioned and noted as never having been exercised under load, but its size is not given. The 400-job figure nearby is the active pool from a 2029 load test and is not an answer to this question.",
+    "citations": ["services/marmot-scheduler.md#capacity"]
+  },
+
+  "STL-01": {
+    "abstain": false,
+    "answer": "45 days, as of 2029-06-12. That note passed its review date of 2030-06-12 and is stale — the note itself warns that retention gets cut or extended without anyone updating a document. Re-verify against the running system before acting on it.",
+    "citations": ["notes/2029-06-12-log-retention.md#policy"],
+    "as_of": "2029-06-12",
+    "flags": ["stale", "needs-reverification"]
+  },
+  "STL-02": {
+    "abstain": false,
+    "answer": "Roughly 18 currency units per shard per month, as of 2029-07-22. This is stale and was provisional even when written: it is one month's bill divided by the shard count, gathered to answer a single question, and it scales with index size rather than shard count. Re-verify before using it for planning.",
+    "citations": ["notes/2029-07-22-shard-storage-cost.md#estimate"],
+    "as_of": "2029-07-22",
+    "flags": ["stale", "provisional"]
+  },
+  "STL-03": {
+    "abstain": false,
+    "answer": "It sustained 400 concurrent jobs without queue growth in a load test, as of 2029-09-05. That figure is past its review date and has not been re-measured since, on hardware that has changed. Treat it as an order of magnitude and re-run the test before relying on it.",
+    "citations": ["services/marmot-scheduler.md#capacity"],
+    "as_of": "2029-09-05",
+    "flags": ["stale", "provisional"]
+  },
+
+  "CON-01": {
+    "abstain": false,
+    "answer": "Bramble. The 2029 note naming Ribbon was superseded by the 2030-09-30 decision, which switched the backend because Ribbon's visibility timeout could not be extended mid-job and long jobs were being redelivered while still running. The old note was deliberately left unedited as a record.",
+    "citations": ["decisions/2030-09-30-queue-backend-switch.md#decision"],
+    "as_of": "2030-09-30"
+  },
+  "CON-02": {
+    "abstain": false,
+    "answer": "10 MiB, raised from 2 MiB on 2031-03-09. Note that the service file still states the old figure and has not been edited; the newer decision record wins. The 8 second upstream timeout was not changed, so a large body on a slow connection can now exhaust it.",
+    "citations": ["decisions/2031-03-09-raise-request-body-limit.md#decision"],
+    "as_of": "2031-03-09"
+  },
+  "CON-03": {
+    "abstain": false,
+    "answer": "Keep the 5 most recent rebuild artifacts. That was raised from the earlier figure in the 2031-05-20 runbook, after two rollbacks in one quarter both wanted an artifact that had already been pruned. The 2030 runbook is superseded.",
+    "citations": ["notes/2031-05-20-indexer-rebuild-runbook.md#artifact-retention"],
+    "as_of": "2031-05-20"
+  }
+}

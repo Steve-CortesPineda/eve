@@ -1,0 +1,682 @@
+#!/bin/sh
+# eve-front -- the Eve front layer CLI.
+#
+# A session should open already knowing where you left off. This command is the
+# front door to that: it composes the briefing, reads and writes the memory
+# store, and tells you when the machinery is broken.
+#
+#   eve-front brief              what you were doing, from local signals
+#   eve-front recall <query>     search the memory store
+#   eve-front remember "<fact>"  write one durable memory
+#   eve-front sync               export memory/ to a mirror for another agent
+#   eve-front doctor             is any of this actually working
+#   eve-front sample             take one activity sample now
+#   eve-front sampler plist|cron|status    scheduling
+#   eve-front install            copy the front layer into $EVE_HOME/bin
+#
+# Any other subcommand is passed through to $EVE_HOME/bin/eve, so `eve-front
+# index` works if the core engine is installed. Symlink this to `eve` if you
+# want one command; the passthrough will not recurse into itself.
+#
+# POSIX sh. No bash 4 syntax, no timeout(1), no eval.
+
+set -eu
+
+EVE_FRONT_VERSION=0.1.0
+
+# Resolve $0 through symlinks, so `ln -s .../bin/eve-front ~/bin/eve` still
+# finds the library that lives next to the real file. `readlink -f` is not
+# portable to stock macOS; plain readlink is.
+SELF=$0
+_hops=0
+while [ -L "$SELF" ] && [ "$_hops" -lt 10 ]; do
+	_target=$(readlink "$SELF" 2>/dev/null) || break
+	case $_target in
+	/*) SELF=$_target ;;
+	*) SELF=$(dirname "$SELF")/$_target ;;
+	esac
+	_hops=$((_hops + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
+
+if [ -f "$SELF_DIR/front-common.sh" ]; then
+	. "$SELF_DIR/front-common.sh"
+elif [ -f "$SELF_DIR/../lib/front-common.sh" ]; then
+	. "$SELF_DIR/../lib/front-common.sh"
+elif [ -f "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh" ]; then
+	. "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh"
+else
+	printf 'eve-front: cannot find front-common.sh next to %s or in ../lib\n' "$SELF_DIR" >&2
+	exit 70
+fi
+
+usage() {
+	sed -n '2,20p' "$SELF" | sed 's/^#\{1,\} \{0,1\}//'
+}
+
+# helper_path NAME -- eve-sample / eve-brief, wherever this copy lives.
+helper_path() {
+	if [ -x "$SELF_DIR/$1" ]; then
+		printf '%s' "$SELF_DIR/$1"
+	elif [ -x "$EVE_HOME/bin/$1" ]; then
+		printf '%s' "$EVE_HOME/bin/$1"
+	else
+		printf ''
+	fi
+}
+
+# template_path NAME -- templates ship with the repo and are copied into
+# $EVE_HOME/templates by `eve-front install`. One source, never embedded twice.
+template_path() {
+	for tp_d in "$SELF_DIR/../templates" "$EVE_HOME/templates" "$SELF_DIR/templates"; do
+		if [ -f "$tp_d/$1" ]; then
+			front_abs_path "$tp_d/$1"
+			return 0
+		fi
+	done
+	printf ''
+}
+
+# core_engine -- absolute path to the core `eve` binary, or empty.
+#
+# Symlinks are resolved on both sides before comparing: if someone links
+# $EVE_HOME/bin/eve at this script (a reasonable thing to do when only the
+# front layer is installed), passing an unknown subcommand through would
+# otherwise re-enter this script forever.
+core_engine() {
+	ce_p="$EVE_HOME/bin/eve"
+	if [ ! -x "$ce_p" ]; then
+		printf ''
+		return 0
+	fi
+	if [ "$(front_resolve_link "$ce_p")" = "$(front_resolve_link "$SELF")" ]; then
+		printf ''
+		return 0
+	fi
+	printf '%s' "$ce_p"
+}
+
+# --------------------------------------------------------------------------
+# subcommands
+# --------------------------------------------------------------------------
+
+cmd_brief() {
+	cb_bin=$(helper_path eve-brief)
+	if [ -z "$cb_bin" ]; then
+		front_warn "eve-front: eve-brief not found (run: eve-front install)"
+		return 70
+	fi
+	"$cb_bin" "$@"
+}
+
+cmd_sample() {
+	cs_bin=$(helper_path eve-sample)
+	if [ -z "$cs_bin" ]; then
+		front_warn "eve-front: eve-sample not found (run: eve-front install)"
+		return 70
+	fi
+	"$cs_bin" "$@"
+}
+
+cmd_recall() {
+	if [ $# -eq 0 ]; then
+		front_warn "usage: eve-front recall <query>"
+		return 64
+	fi
+	cr_engine=$(core_engine)
+	if [ -z "$cr_engine" ]; then
+		front_warn "eve-front: the retrieval engine ($EVE_HOME/bin/eve) is not installed."
+		front_warn "The front layer works without it, but recall needs it. Run the repo installer."
+		return 69
+	fi
+	# Frozen interface: exit 0 with no output means nothing cleared the
+	# relevance gate. That is the common case and is not an error.
+	"$cr_engine" search --query "$*" --format plain
+}
+
+cmd_remember() {
+	cm_type=note
+	cm_tags=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--type)
+			if [ $# -lt 2 ]; then
+				front_warn "eve-front: --type needs a value"
+				return 64
+			fi
+			cm_type=$2
+			shift 2
+			;;
+		--tag)
+			if [ $# -lt 2 ]; then
+				front_warn "eve-front: --tag needs a value"
+				return 64
+			fi
+			cm_tags="$cm_tags${cm_tags:+, }$2"
+			shift 2
+			;;
+		--) shift; break ;;
+		-*)
+			front_warn "eve-front remember: unknown option: $1"
+			return 64
+			;;
+		*) break ;;
+		esac
+	done
+
+	cm_fact=$*
+	cm_fact=$(front_trim "$cm_fact")
+	if [ -z "$cm_fact" ]; then
+		front_warn 'usage: eve-front remember "<one durable fact>" [--type feedback] [--tag deploy]'
+		return 64
+	fi
+
+	mkdir -p "$EVE_HOME/memory" 2>/dev/null || {
+		front_warn "eve-front: cannot create $EVE_HOME/memory"
+		return 73
+	}
+
+	# Idempotence: the same fact twice does not create a second file.
+	cm_dupe=$(grep -rlF -e "$cm_fact" "$EVE_HOME/memory" 2>/dev/null | head -n 1 || true)
+	if [ -n "$cm_dupe" ]; then
+		printf 'already remembered: %s\n' "$(front_tilde "$cm_dupe")"
+		return 0
+	fi
+
+	cm_slug=$(printf '%s' "$cm_fact" | tr '[:upper:]' '[:lower:]' |
+		tr -c 'a-z0-9' '-' | tr -s '-' | cut -c1-48 |
+		sed -e 's/^-*//' -e 's/-*$//')
+	if [ -z "$cm_slug" ]; then cm_slug="note-$(date -u +%Y%m%d-%H%M%S)"; fi
+
+	cm_file="$EVE_HOME/memory/$cm_slug.md"
+	cm_n=2
+	while [ -e "$cm_file" ]; do
+		cm_file="$EVE_HOME/memory/$cm_slug-$cm_n.md"
+		cm_n=$((cm_n + 1))
+		if [ "$cm_n" -gt 50 ]; then
+			front_warn "eve-front: too many files named like $cm_slug"
+			return 73
+		fi
+	done
+
+	cm_title=$(printf '%s\n' "$cm_fact" | awk '
+		{ i = index($0, ". "); print (i > 0 ? substr($0, 1, i - 1) : $0); exit }
+	' | cut -c1-72)
+	cm_today=$(date -u +%Y-%m-%d)
+
+	{
+		printf -- '---\n'
+		printf 'title: %s\n' "$cm_title"
+		printf 'type: %s\n' "$cm_type"
+		if [ -n "$cm_tags" ]; then printf 'tags: [%s]\n' "$cm_tags"; fi
+		printf 'created: %s\n' "$cm_today"
+		printf 'updated: %s\n' "$cm_today"
+		printf 'status: active\n'
+		printf -- '---\n\n'
+		printf '%s\n' "$cm_fact"
+	} >"$cm_file"
+
+	printf 'wrote %s\n' "$(front_tilde "$cm_file")"
+
+	# Regenerate the index. It is derived, so leaving it stale after adding a
+	# memory means the one file a Tier 0 reader consults no longer describes the
+	# store -- and `eve-doctor` would (correctly) start reporting a warning that
+	# this command caused. If the core engine is not installed there is no index
+	# to keep current, and saying nothing is right.
+	cm_engine=$(core_engine)
+	if [ -n "$cm_engine" ]; then
+		"$cm_engine" index >/dev/null 2>&1 || true
+	fi
+
+	printf 'Add the evidence: why is this true, and what should change because of it?\n'
+}
+
+cmd_sync() {
+	cy_name=mirror
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--name)
+			if [ $# -lt 2 ]; then
+				front_warn "eve-front: --name needs a value"
+				return 64
+			fi
+			cy_name=$2
+			shift 2
+			;;
+		*)
+			front_warn "eve-front sync: unknown option: $1"
+			return 64
+			;;
+		esac
+	done
+	case $cy_name in
+	*/* | '' | .*)
+		front_warn "eve-front: --name must be a plain directory name"
+		return 64
+		;;
+	esac
+
+	cy_src="$EVE_HOME/memory"
+	cy_dst="$EVE_HOME/mirrors/$cy_name"
+	if [ ! -d "$cy_src" ]; then
+		front_warn "eve-front: no memory store at $cy_src"
+		return 69
+	fi
+	mkdir -p "$cy_dst" 2>/dev/null || {
+		front_warn "eve-front: cannot create $cy_dst"
+		return 73
+	}
+
+	cy_marker='<!-- generated by eve-front sync; edit the source, not this copy -->'
+	cy_wrote=0
+	cy_removed=0
+
+	for cy_f in "$cy_src"/*.md; do
+		if [ ! -f "$cy_f" ]; then continue; fi
+		cy_b=$(basename "$cy_f")
+		# The scaffold and the indexes are not memories, and a mirror of
+		# {{PLACEHOLDERS}} helps nobody. Same list as `eve search`.
+		case $cy_b in
+		TEMPLATE.md | MEMORY.md | INDEX.md | README.md) continue ;;
+		esac
+		cy_out="$cy_dst/$cy_b"
+		# Deterministic: identical input produces identical bytes, so a
+		# mirror that is already correct is not rewritten and does not get a
+		# fresh mtime it has not earned.
+		{
+			printf '%s\n' "$cy_marker"
+			printf '<!-- source: %s -->\n' "$(front_tilde "$cy_f")"
+			cat "$cy_f"
+		} >"$cy_dst/.eve-sync.tmp"
+		if [ -f "$cy_out" ] && cmp -s "$cy_dst/.eve-sync.tmp" "$cy_out"; then
+			rm -f "$cy_dst/.eve-sync.tmp"
+		else
+			mv "$cy_dst/.eve-sync.tmp" "$cy_out"
+			cy_wrote=$((cy_wrote + 1))
+		fi
+	done
+
+	# Reconcile: a derived copy whose source is gone is a lie. Only files
+	# carrying our own generated marker are ever removed -- anything a human
+	# put in this directory is left alone.
+	for cy_f in "$cy_dst"/*.md; do
+		if [ ! -f "$cy_f" ]; then continue; fi
+		cy_b=$(basename "$cy_f")
+		if [ -f "$cy_src/$cy_b" ]; then continue; fi
+		if head -n 1 "$cy_f" 2>/dev/null | grep -qF 'generated by eve-front sync'; then
+			rm -f "$cy_f"
+			cy_removed=$((cy_removed + 1))
+		fi
+	done
+
+	printf 'mirror: %s\n' "$(front_tilde "$cy_dst")"
+	printf '  %s written, %s removed\n' "$cy_wrote" "$cy_removed"
+	printf '\nThe mirror is derived, one-way, and excluded from search by path.\n'
+	printf 'To let another agent read it, link it from that agent'\''s own directory:\n'
+	printf '  ln -s %s /path/to/other-agent/memory\n' "$cy_dst"
+	printf 'This command will not create that link for you.\n'
+}
+
+cmd_sampler() {
+	cp_sub=${1:-status}
+	if [ $# -gt 0 ]; then shift; fi
+	cp_label=${EVE_SAMPLER_LABEL:-local.eve.sampler}
+	cp_interval=${EVE_SAMPLER_INTERVAL:-600}
+	cp_bin="$EVE_HOME/bin"
+	cp_log="$EVE_STATE_DIR/sampler.err.log"
+
+	case $cp_sub in
+	plist)
+		cp_t=$(template_path sampler.plist)
+		if [ -z "$cp_t" ]; then
+			front_warn "eve-front: sampler.plist template not found (run: eve-front install)"
+			return 69
+		fi
+		sed -e "s|__LABEL__|$cp_label|g" \
+			-e "s|__EVE_BIN__|$cp_bin|g" \
+			-e "s|__EVE_HOME__|$EVE_HOME|g" \
+			-e "s|__INTERVAL__|$cp_interval|g" \
+			-e "s|__LOG__|$cp_log|g" "$cp_t"
+		;;
+	cron)
+		cp_t=$(template_path sampler.cron)
+		if [ -z "$cp_t" ]; then
+			front_warn "eve-front: sampler.cron template not found (run: eve-front install)"
+			return 69
+		fi
+		sed -e "s|__EVE_BIN__|$cp_bin|g" \
+			-e "s|__EVE_HOME__|$EVE_HOME|g" \
+			-e "s|__LOG__|$cp_log|g" "$cp_t"
+		;;
+	status)
+		printf 'label:    %s\n' "$cp_label"
+		printf 'command:  %s/eve-sample\n' "$cp_bin"
+		printf 'roots:    %s\n' "${EVE_SAMPLE_ROOTS:-(none configured -- sampler is off)}"
+		if [ -f "$EVE_SAMPLE_MARKER" ]; then
+			printf 'last run: %s\n' "$(front_age_human $(($(front_now_epoch) - $(front_file_mtime "$EVE_SAMPLE_MARKER"))))"
+		else
+			printf 'last run: never\n'
+		fi
+		if [ -f "$EVE_ACTIVITY_LOG" ]; then
+			printf 'log:      %s (%s lines)\n' "$(front_tilde "$EVE_ACTIVITY_LOG")" \
+				"$(wc -l <"$EVE_ACTIVITY_LOG" | tr -d ' ')"
+		else
+			printf 'log:      (none yet)\n'
+		fi
+		printf 'schedule: %s\n' "$(sampler_schedule_state "$cp_label")"
+		;;
+	*)
+		front_warn "usage: eve-front sampler [status|plist|cron]"
+		return 64
+		;;
+	esac
+}
+
+sampler_schedule_state() {
+	ss_label=$1
+	if front_have launchctl && launchctl list "$ss_label" >/dev/null 2>&1; then
+		printf 'launchd job %s is loaded' "$ss_label"
+		return 0
+	fi
+	if front_have crontab && crontab -l 2>/dev/null | grep -q 'eve-sample'; then
+		printf 'a crontab line runs eve-sample'
+		return 0
+	fi
+	printf 'not scheduled (see: eve-front sampler plist | cron)'
+}
+
+cmd_install() {
+	ci_dst="$EVE_HOME/bin"
+	mkdir -p "$ci_dst" "$EVE_HOME/templates" "$EVE_STATE_DIR" 2>/dev/null || {
+		front_warn "eve-front: cannot write into $EVE_HOME"
+		return 73
+	}
+	ci_lib=
+	if [ -f "$SELF_DIR/front-common.sh" ]; then
+		ci_lib="$SELF_DIR/front-common.sh"
+	elif [ -f "$SELF_DIR/../lib/front-common.sh" ]; then
+		ci_lib="$SELF_DIR/../lib/front-common.sh"
+	fi
+
+	for ci_f in "$SELF_DIR/eve-front" "$SELF_DIR/eve-sample" "$SELF_DIR/eve-brief" "$ci_lib"; do
+		if [ -z "$ci_f" ] || [ ! -f "$ci_f" ]; then continue; fi
+		ci_b=$(basename "$ci_f")
+		if [ "$(front_abs_path "$ci_f")" = "$(front_abs_path "$ci_dst/$ci_b")" ]; then
+			printf 'unchanged  %s\n' "$(front_tilde "$ci_dst/$ci_b")"
+			continue
+		fi
+		if [ -f "$ci_dst/$ci_b" ] && cmp -s "$ci_f" "$ci_dst/$ci_b"; then
+			printf 'unchanged  %s\n' "$(front_tilde "$ci_dst/$ci_b")"
+			continue
+		fi
+		cp "$ci_f" "$ci_dst/$ci_b.eve-tmp" && mv "$ci_dst/$ci_b.eve-tmp" "$ci_dst/$ci_b"
+		case $ci_b in
+		*.sh) chmod 644 "$ci_dst/$ci_b" ;;
+		*) chmod 755 "$ci_dst/$ci_b" ;;
+		esac
+		printf 'installed  %s\n' "$(front_tilde "$ci_dst/$ci_b")"
+	done
+
+	for ci_t in sampler.plist sampler.cron; do
+		ci_src=$(template_path "$ci_t")
+		if [ -z "$ci_src" ]; then continue; fi
+		if [ "$(front_abs_path "$ci_src")" = "$(front_abs_path "$EVE_HOME/templates/$ci_t")" ]; then continue; fi
+		if [ -f "$EVE_HOME/templates/$ci_t" ] && cmp -s "$ci_src" "$EVE_HOME/templates/$ci_t"; then
+			printf 'unchanged  %s\n' "$(front_tilde "$EVE_HOME/templates/$ci_t")"
+			continue
+		fi
+		cp "$ci_src" "$EVE_HOME/templates/$ci_t.eve-tmp" &&
+			mv "$EVE_HOME/templates/$ci_t.eve-tmp" "$EVE_HOME/templates/$ci_t"
+		printf 'installed  %s\n' "$(front_tilde "$EVE_HOME/templates/$ci_t")"
+	done
+
+	printf '\nNext: set the roots you want sampled, then schedule it.\n'
+	printf '  printf "EVE_SAMPLE_ROOTS=%%s\\n" "$HOME/src/harborlight" >> %s\n' "$(front_tilde "$EVE_HOME/config")"
+	printf '  %s/eve-front sampler plist   # or: sampler cron\n' "$(front_tilde "$ci_dst")"
+}
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+DOCTOR_FAILED=0
+ok() { printf 'PASS  %s\n' "$*"; }
+warn() { printf 'WARN  %s\n' "$*"; }
+bad() {
+	printf 'FAIL  %s\n' "$*"
+	DOCTOR_FAILED=1
+}
+remedy() { printf '      -> %s\n' "$*"; }
+
+cmd_doctor() {
+	printf 'eve front layer %s -- doctor\n\n' "$EVE_FRONT_VERSION"
+
+	# 1. EVE_HOME
+	if [ -d "$EVE_HOME" ]; then
+		ok "EVE_HOME exists: $(front_tilde "$EVE_HOME")"
+	else
+		bad "EVE_HOME does not exist: $(front_tilde "$EVE_HOME")"
+		remedy "run the repo installer, or: mkdir -p $EVE_HOME/memory"
+	fi
+	if [ -d "$EVE_HOME/memory" ]; then
+		cd_n=$(front_find_memories | wc -l | tr -d ' ')
+		if [ "$cd_n" -gt 0 ]; then
+			ok "memory store: $cd_n file(s)"
+		else
+			warn "memory store is empty"
+			remedy 'eve-front remember "the first thing you keep re-explaining"'
+		fi
+	else
+		warn "no memory directory at $(front_tilde "$EVE_HOME/memory")"
+	fi
+
+	# 2. where the front layer is running from
+	if [ -x "$EVE_HOME/bin/eve-sample" ] && [ -x "$EVE_HOME/bin/eve-brief" ]; then
+		ok "front layer installed in $(front_tilde "$EVE_HOME/bin")"
+	else
+		warn "front layer is running from $(front_tilde "$SELF_DIR"), not $(front_tilde "$EVE_HOME/bin")"
+		remedy "eve-front install   (scheduled jobs need a path that survives moving the clone)"
+	fi
+
+	# 3. effective configuration, as the scripts resolve it -- not as the file
+	#    reads. A config value is only real if the process can print it.
+	printf '\n      effective config:\n'
+	for cd_kv in \
+		"EVE_HOME=$EVE_HOME" \
+		"EVE_DISABLE=$EVE_DISABLE" \
+		"EVE_SAMPLE_ROOTS=$EVE_SAMPLE_ROOTS" \
+		"EVE_SAMPLE_FILES=$EVE_SAMPLE_FILES" \
+		"EVE_SAMPLE_GIT=$EVE_SAMPLE_GIT" \
+		"EVE_SAMPLE_APPS=$EVE_SAMPLE_APPS" \
+		"EVE_SAMPLE_PATHS=$EVE_SAMPLE_PATHS" \
+		"EVE_SAMPLE_MAX_PATHS=$EVE_SAMPLE_MAX_PATHS" \
+		"EVE_FRONT_HOURS=$EVE_FRONT_HOURS" \
+		"EVE_FRONT_MAX_CHARS=$EVE_FRONT_MAX_CHARS" \
+		"EVE_FRONT_STATE_MEMORY=$EVE_FRONT_STATE_MEMORY" \
+		"EVE_FRONT_COMPOSER=${EVE_FRONT_COMPOSER:-(none)}"; do
+		printf '        %s\n' "$cd_kv"
+	done
+	printf '\n'
+
+	if [ "$EVE_DISABLE" = "1" ]; then
+		warn "EVE_DISABLE=1 -- every hook and the sampler exit immediately"
+		remedy "set EVE_DISABLE=0 in $(front_tilde "$EVE_HOME/config")"
+	fi
+
+	# 4. sampler roots
+	case $(printf '%s' "$EVE_SAMPLE_ROOTS" | tr -d ':') in
+	'')
+		warn "sampler: no roots configured, nothing is being watched"
+		remedy "add EVE_SAMPLE_ROOTS=/path/to/project to $(front_tilde "$EVE_HOME/config")"
+		;;
+	*)
+		cd_bad=0
+		cd_oifs=$IFS
+		IFS=:
+		set -f
+		set -- $EVE_SAMPLE_ROOTS
+		set +f
+		IFS=$cd_oifs
+		for cd_r in "$@"; do
+			if [ -z "$cd_r" ]; then continue; fi
+			if [ ! -d "$cd_r" ]; then
+				bad "sampler root does not exist: $cd_r"
+				cd_bad=1
+			elif [ "$cd_r" = "/" ] || [ "$(front_abs_path "$cd_r")" = "$HOME" ]; then
+				bad "sampler root is too broad and will be skipped: $cd_r"
+				remedy "point roots at individual projects, never / or \$HOME"
+				cd_bad=1
+			fi
+		done
+		if [ "$cd_bad" -eq 0 ]; then ok "sampler roots all exist"; fi
+		;;
+	esac
+
+	# 5. is the sampler actually running
+	if [ -f "$EVE_SAMPLE_MARKER" ]; then
+		cd_age=$(($(front_now_epoch) - $(front_file_mtime "$EVE_SAMPLE_MARKER")))
+		if [ "$cd_age" -lt 5400 ]; then
+			ok "sampler ran $(front_age_human "$cd_age")"
+		else
+			warn "sampler last ran $(front_age_human "$cd_age")"
+			remedy "eve-front sampler status"
+		fi
+	else
+		warn "sampler has never run"
+		remedy "eve-front sample --verbose   (the first run only sets a marker)"
+	fi
+	printf '      schedule: %s\n' "$(sampler_schedule_state "${EVE_SAMPLER_LABEL:-local.eve.sampler}")"
+	if [ -f "$EVE_ACTIVITY_LOG" ]; then
+		cd_lines=$(wc -l <"$EVE_ACTIVITY_LOG" | tr -d ' ')
+		ok "activity log: $cd_lines line(s), $(front_tilde "$EVE_ACTIVITY_LOG")"
+	else
+		warn "no activity log yet"
+	fi
+
+	# 6. does the brief compose
+	cd_brief_bin=$(helper_path eve-brief)
+	if [ -z "$cd_brief_bin" ]; then
+		bad "eve-brief not found"
+		remedy "eve-front install"
+	else
+		cd_out=$("$cd_brief_bin" --no-composer 2>/dev/null || true)
+		if [ -n "$cd_out" ]; then
+			cd_chars=$(printf '%s' "$cd_out" | wc -c | tr -d ' ')
+			ok "brief composes: $cd_chars chars, budget $EVE_FRONT_MAX_CHARS"
+		else
+			warn "brief is empty -- no activity, no working state, no session log yet"
+		fi
+	fi
+	if [ -f "$EVE_BRIEF_FILE" ]; then
+		cd_bage=$(($(front_now_epoch) - $(front_file_mtime "$EVE_BRIEF_FILE")))
+		if [ "$cd_bage" -lt 7200 ]; then
+			ok "brief.md is fresh ($(front_age_human "$cd_bage"))"
+		else
+			warn "brief.md is $(front_age_human "$cd_bage") -- SessionStart will ignore it"
+			remedy "eve-front brief --write   (or schedule the sampler)"
+		fi
+	fi
+
+	# 7. retrieval, end to end. Not "is it configured" -- run it and print
+	#    the bytes. A component that reports success is not evidence.
+	cd_engine=$(core_engine)
+	if [ -z "$cd_engine" ]; then
+		warn "retrieval engine not installed ($(front_tilde "$EVE_HOME/bin/eve"))"
+		remedy "install the core repo; the front layer works without it, recall does not"
+	else
+		cd_probe=$(front_find_memories | sort | head -n 1 || true)
+		if [ -z "$cd_probe" ]; then
+			warn "retrieval engine present but the store is empty, nothing to probe with"
+		else
+			cd_term=$(basename "$cd_probe" .md | tr '-' ' ')
+			cd_hits=$("$cd_engine" search --query "$cd_term" --format tsv --limit 3 2>/dev/null || true)
+			if [ -n "$cd_hits" ]; then
+				ok "retrieval works; probe \"$cd_term\" returned:"
+				printf '%s\n' "$cd_hits" | sed 's/^/        /'
+			else
+				warn "retrieval returned nothing for \"$cd_term\""
+				remedy "$(front_tilde "$cd_engine") search --query \"$cd_term\" --format tsv"
+			fi
+		fi
+	fi
+
+	# 8. hooks. The core doctor checks these in depth; this is the shallow
+	#    version so the front layer can stand alone.
+	cd_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+	if [ -f "$cd_settings" ]; then
+		cd_reg=$(grep -o '[^"]*/hooks/eve-[a-z-]*\.sh' "$cd_settings" 2>/dev/null | sort || true)
+		if [ -z "$cd_reg" ]; then
+			warn "no Eve hooks registered in $(front_tilde "$cd_settings")"
+			remedy "run the repo installer (Tier 1)"
+		else
+			cd_total=$(printf '%s\n' "$cd_reg" | wc -l | tr -d ' ')
+			cd_uniq=$(printf '%s\n' "$cd_reg" | sort -u | wc -l | tr -d ' ')
+			if [ "$cd_total" -ne "$cd_uniq" ]; then
+				bad "duplicate hook registrations ($cd_total entries, $cd_uniq distinct)"
+				remedy "edit $(front_tilde "$cd_settings") and remove the repeats"
+			else
+				ok "$cd_uniq Eve hook(s) registered"
+			fi
+			printf '%s\n' "$cd_reg" | sort -u | while IFS= read -r cd_h; do
+				if [ -x "$cd_h" ]; then
+					printf '        ok      %s\n' "$(front_tilde "$cd_h")"
+				else
+					printf '        MISSING %s\n' "$(front_tilde "$cd_h")"
+				fi
+			done
+			if printf '%s\n' "$cd_reg" | while IFS= read -r cd_h; do
+				[ -x "$cd_h" ] || exit 1
+			done; then :; else
+				bad "a registered hook path does not resolve to an executable file"
+				remedy "re-run the repo installer; paths in settings.json must be absolute"
+			fi
+		fi
+	else
+		warn "no settings.json at $(front_tilde "$cd_settings") -- Tier 1 not installed"
+	fi
+
+	if [ -x "$EVE_HOME/bin/eve-doctor" ]; then
+		printf '\n      core engine checks: %s\n' "$(front_tilde "$EVE_HOME/bin/eve-doctor")"
+	fi
+
+	printf '\n'
+	if [ "$DOCTOR_FAILED" -eq 1 ]; then
+		printf 'One or more checks FAILED.\n'
+		return 1
+	fi
+	printf 'No failures.\n'
+}
+
+# --------------------------------------------------------------------------
+# dispatch
+# --------------------------------------------------------------------------
+front_cfg_load
+
+CMD=${1:-help}
+if [ $# -gt 0 ]; then shift; fi
+
+case $CMD in
+brief) cmd_brief "$@" ;;
+recall | search-front) cmd_recall "$@" ;;
+remember) cmd_remember "$@" ;;
+sync) cmd_sync "$@" ;;
+doctor) cmd_doctor "$@" ;;
+sample) cmd_sample "$@" ;;
+sampler) cmd_sampler "$@" ;;
+install) cmd_install "$@" ;;
+version | --version | -V) printf 'eve front layer %s\n' "$EVE_FRONT_VERSION" ;;
+help | --help | -h) usage ;;
+*)
+	ENGINE=$(core_engine)
+	# Second belt: even if path resolution were fooled, a passthrough never
+	# passes through twice.
+	if [ -n "$ENGINE" ] && [ -z "${EVE_FRONT_PASSTHROUGH:-}" ]; then
+		EVE_FRONT_PASSTHROUGH=1
+		export EVE_FRONT_PASSTHROUGH
+		exec "$ENGINE" "$CMD" "$@"
+	fi
+	front_warn "eve-front: unknown subcommand: $CMD"
+	front_warn "(the core engine at $EVE_HOME/bin/eve is not installed, so it cannot be passed through)"
+	usage >&2
+	exit 64
+	;;
+esac

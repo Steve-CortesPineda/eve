@@ -1,0 +1,82 @@
+#!/bin/sh
+# kb -- Eve knowledge-base tool.
+#
+# POSIX sh dispatcher over the python3 implementations in kb/lib. No packages,
+# no virtualenv, no network. The only requirement is a python3 on PATH, which
+# macOS and every mainstream Linux already have.
+#
+#   kb search <query...>   ranked, cited passages
+#   kb ingest <paths...>   file existing notes in with provenance front matter
+#   kb consolidate         propose promotions to atomic memory (never promotes)
+#   kb doctor              report front-matter and freshness rot
+#
+# Set EVE_KB_ROOT to point at a knowledge base other than the one next to this
+# script, or pass --root to any subcommand.
+
+set -eu
+
+usage() {
+	cat <<'EOF'
+usage: kb <command> [options]
+
+commands:
+  search <query...>   ranked, cited passages from the knowledge base
+  ingest <paths...>   file existing markdown/text into the KB with provenance
+  consolidate         propose durable facts for promotion to atomic memory
+  doctor              report missing provenance, staleness, broken supersedes
+
+common options (all commands):
+  --root DIR          knowledge-base root (default: $EVE_KB_ROOT, else kb/)
+  -h, --help          command-specific help
+
+examples:
+  kb search cache invalidation
+  kb search "deploy target" --type decisions --format cite
+  kb ingest ~/notes/exports --type notes --source export:old-wiki
+  kb consolidate --since 30
+  kb doctor --fix
+EOF
+}
+
+# Resolve this script's directory, following symlinks, without readlink -f
+# (which is not available on macOS).
+self=$0
+while [ -L "$self" ]; do
+	dir=$(cd -P "$(dirname "$self")" && pwd)
+	link=$(ls -ld "$self" | sed -e 's/^.* -> //')
+	case $link in
+	/*) self=$link ;;
+	*) self=$dir/$link ;;
+	esac
+done
+BIN_DIR=$(cd -P "$(dirname "$self")" && pwd)
+LIB_DIR=$(cd -P "$BIN_DIR/../lib" && pwd)
+
+if ! command -v python3 >/dev/null 2>&1; then
+	echo "kb: python3 not found on PATH." >&2
+	echo "kb: install it (macOS: xcode-select --install) and try again." >&2
+	exit 127
+fi
+
+if [ $# -eq 0 ]; then
+	usage
+	exit 2
+fi
+
+cmd=$1
+shift
+
+case $cmd in
+search | ingest | consolidate | doctor)
+	exec python3 "$LIB_DIR/kb_$cmd.py" "$@"
+	;;
+-h | --help | help)
+	usage
+	;;
+*)
+	echo "kb: unknown command: $cmd" >&2
+	echo >&2
+	usage >&2
+	exit 2
+	;;
+esac

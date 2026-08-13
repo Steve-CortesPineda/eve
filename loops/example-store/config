@@ -1,0 +1,21 @@
+# Example Eve config, used by the loop dry-run examples in loops/*/README.md.
+# Real installs get this file from `eve init`. Keys are documented in
+# docs/03-hooks.md; the loop-specific keys are
+# documented in each loop's README.
+
+EVE_RECALL_LIMIT=3
+EVE_SNIPPET_CHARS=150
+
+# Gap detection
+EVE_GAP_MIN_HITS=3
+EVE_GAP_MIN_DAYS=2
+EVE_GAP_SINCE_DAYS=30
+
+# Reality reconcile
+EVE_RECONCILE_STREAK=3
+EVE_RECONCILE_MIN_GAP_SECS=3600
+EVE_RECONCILE_MAX_FAIL_PCT=50
+EVE_RECONCILE_CONTROL_HOST=example.com
+
+# Outcome reweight
+EVE_OUTCOME_STALE_DAYS=90

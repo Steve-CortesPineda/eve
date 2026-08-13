@@ -1,0 +1,24 @@
+# crontab line for the Eve activity sampler (Linux, or macOS without launchd).
+#
+# Placeholders, all filled in by `eve-front sampler cron`:
+#   __EVE_BIN__    absolute path to $EVE_HOME/bin
+#   __EVE_HOME__   absolute path to $EVE_HOME
+#   __LOG__        file that receives stderr
+#
+# Install:
+#   eve-front sampler cron            # look at it first
+#   crontab -l > /tmp/ct 2>/dev/null || true
+#   eve-front sampler cron | grep -v '^#' >> /tmp/ct
+#   crontab /tmp/ct
+#
+# Uninstall (leaves every memory and every log in place):
+#   crontab -e        # delete the eve-sample line
+#
+# PATH is set inline because cron runs with a nearly empty environment, and
+# without it the sampler silently loses git (branch and dirty state disappear
+# from the brief while everything still reports success).
+#
+# The minute offset is 7 rather than 0 so this does not pile onto the same
+# tick as every other cron job on the machine.
+
+7,17,27,37,47,57 * * * * PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin EVE_HOME=__EVE_HOME__ __EVE_BIN__/eve-sample >/dev/null 2>>__LOG__

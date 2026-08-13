@@ -1,0 +1,304 @@
+#!/bin/sh
+# eve-brief -- compose a short, factual "where you left off" briefing.
+#
+# CONSUMER: the SessionStart hook, via $EVE_HOME/state/brief.md, and you, via
+# `eve-front brief`. Exactly one process writes brief.md. If you also install
+# a Tier 2 brief loop, disable one of them -- two writers on one path is how
+# a system starts contradicting itself.
+#
+# Sources, in order:
+#   1. $EVE_HOME/state/activity.log   what you touched (from eve-sample)
+#   2. $EVE_HOME/memory/<state>.md    what is in flight and unresolved
+#   3. $EVE_HOME/sessions/<newest>.md when you last worked and how much
+#
+# Deterministic and template-based. No model call, no network, no daemon. The
+# same inputs produce the same bytes. An optional composer (EVE_FRONT_COMPOSER)
+# can rewrite the text through a local model; if it fails, is missing, or
+# returns nothing, the deterministic text is used unchanged.
+#
+# Usage: eve-brief [--hours N] [--max-chars N] [--write] [--quiet] [--no-composer]
+#
+# Prints nothing at all when there is nothing to say. Silence is a valid brief.
+#
+# POSIX sh. No bash 4 syntax, no timeout(1), no eval.
+
+set -eu
+
+SELF=$0
+_hops=0
+while [ -L "$SELF" ] && [ "$_hops" -lt 10 ]; do
+	_target=$(readlink "$SELF" 2>/dev/null) || break
+	case $_target in
+	/*) SELF=$_target ;;
+	*) SELF=$(dirname "$SELF")/$_target ;;
+	esac
+	_hops=$((_hops + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
+
+if [ -f "$SELF_DIR/front-common.sh" ]; then
+	. "$SELF_DIR/front-common.sh"
+elif [ -f "$SELF_DIR/../lib/front-common.sh" ]; then
+	. "$SELF_DIR/../lib/front-common.sh"
+elif [ -f "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh" ]; then
+	. "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh"
+else
+	exit 0
+fi
+
+DO_WRITE=0
+QUIET=0
+USE_COMPOSER=1
+OPT_HOURS=
+OPT_MAX=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--hours)
+		if [ $# -lt 2 ]; then
+			front_warn "eve-brief: --hours needs a number"
+			exit 64
+		fi
+		OPT_HOURS=$2
+		shift 2
+		;;
+	--max-chars)
+		if [ $# -lt 2 ]; then
+			front_warn "eve-brief: --max-chars needs a number"
+			exit 64
+		fi
+		OPT_MAX=$2
+		shift 2
+		;;
+	--write | -w)
+		DO_WRITE=1
+		shift
+		;;
+	--quiet | -q)
+		QUIET=1
+		shift
+		;;
+	--no-composer)
+		USE_COMPOSER=0
+		shift
+		;;
+	-h | --help)
+		sed -n '2,24p' "$SELF" | sed 's/^#\{1,\} \{0,1\}//'
+		exit 0
+		;;
+	*)
+		front_warn "eve-brief: unknown option: $1"
+		exit 64
+		;;
+	esac
+done
+
+front_cfg_load
+if [ "$EVE_DISABLE" = "1" ]; then exit 0; fi
+if [ ! -d "$EVE_HOME" ]; then exit 0; fi
+
+if [ -n "$OPT_HOURS" ]; then EVE_FRONT_HOURS=$(front_int "$OPT_HOURS" 12 1 720); fi
+if [ -n "$OPT_MAX" ]; then EVE_FRONT_MAX_CHARS=$(front_int "$OPT_MAX" 500 80 8000); fi
+
+NOW=$(front_now_epoch)
+CUTOFF=$((NOW - EVE_FRONT_HOURS * 3600))
+
+# --------------------------------------------------------------------------
+# 1. activity -- one line per project, most recently active first, capped.
+# --------------------------------------------------------------------------
+ACTIVITY=
+APPS=
+if [ -f "$EVE_ACTIVITY_LOG" ]; then
+	ACTIVITY=$(
+		awk -F '\t' -v cutoff="$CUTOFF" -v now="$NOW" -v maxpaths=3 '
+			function reltime(t,   d) {
+				d = now - t
+				if (d < 120)    return "just now"
+				if (d < 5400)   return int(d / 60) "m ago"
+				if (d < 172800) return int(d / 3600) "h ago"
+				return int(d / 86400) "d ago"
+			}
+			($1 + 0) < cutoff { next }
+			$3 == "git" {
+				s = $4; seen[s] = 1
+				branch[s] = $5; dirty[s] = $6
+				if (($1 + 0) > last[s]) last[s] = $1 + 0
+				next
+			}
+			$3 == "files" {
+				s = $4; seen[s] = 1
+				if (($1 + 0) > last[s]) last[s] = $1 + 0
+				touched[s] += $5
+				for (i = 6; i <= NF; i++) {
+					if ($i == "" || (s SUBSEP $i) in pathseen) continue
+					pathseen[s SUBSEP $i] = 1
+					npaths[s]++
+					if (npaths[s] <= maxpaths)
+						paths[s] = paths[s] (paths[s] == "" ? "" : ", ") $i
+				}
+				next
+			}
+			END {
+				for (s in seen) {
+					line = "- " s
+					if (s in branch) {
+						line = line " [" branch[s]
+						if (dirty[s] == "-")     line = line "]"
+						else if (dirty[s] + 0 == 0) line = line ", clean]"
+						else                     line = line ", " dirty[s] " uncommitted]"
+					}
+					if (paths[s] != "") {
+						line = line " " paths[s]
+						if (npaths[s] > maxpaths)
+							line = line " +" (npaths[s] - maxpaths) " more"
+					} else if (touched[s] > 0) {
+						line = line " " touched[s] " files changed"
+					}
+					line = line " (" reltime(last[s]) ")"
+					print last[s] "\t" line
+				}
+			}
+		' "$EVE_ACTIVITY_LOG" 2>/dev/null | sort -k1,1rn -k2 | head -n 3 | cut -f2- || true
+	)
+	APPS=$(
+		awk -F '\t' -v cutoff="$CUTOFF" '
+			($1 + 0) >= cutoff && $3 == "app" && $5 != "" {
+				if (!($5 in seen)) { seen[$5] = 1; order[++n] = $5 }
+			}
+			END {
+				out = ""
+				for (i = n; i >= 1 && i > n - 3; i--)
+					out = out (out == "" ? "" : ", ") order[i]
+				if (out != "") print "- Mostly in: " out
+			}
+		' "$EVE_ACTIVITY_LOG" 2>/dev/null || true
+	)
+fi
+
+# --------------------------------------------------------------------------
+# 2. working state -- optional sections of one ordinary memory file.
+#
+# Nothing about the memory format changes for this. If the file does not
+# exist, or has no such sections, these lines are simply absent.
+# --------------------------------------------------------------------------
+STATE_FILE="$EVE_HOME/memory/$EVE_FRONT_STATE_MEMORY.md"
+
+section() { # section LABEL FILE -- first two items under a heading
+	if [ ! -f "$2" ]; then return 0; fi
+	awk -v want="$1" -v maxlines="$EVE_MAX_LINES" '
+		function clean(s) {
+			gsub(/^[ \t]+|[ \t]+$/, "", s)
+			gsub(/[*_`#>]/, "", s)
+			gsub(/^[ \t]+|[ \t]+$/, "", s)
+			return s
+		}
+		FNR > maxlines { exit }
+		{
+			h = tolower(clean($0))
+			sub(/:$/, "", h)
+			if (h == want) { inside = 1; next }
+			if (!inside) next
+			if ($0 ~ /^[ \t]*$/) { if (got) exit; next }
+			if ($0 ~ /^[ \t]*#/) exit
+			if (h ~ /:$/ && $0 ~ /^\*\*/) exit
+			item = $0
+			sub(/^[ \t]*[-*][ \t]+/, "", item)
+			item = clean(item)
+			if (item == "") next
+			out = out (out == "" ? "" : "; ") item
+			got++
+			if (got >= 2) exit
+		}
+		END { if (out != "") print substr(out, 1, 140) }
+	' "$2" 2>/dev/null || true
+}
+
+IN_FLIGHT=$(section "in flight" "$STATE_FILE")
+UNRESOLVED=$(section "unresolved" "$STATE_FILE")
+if [ -z "$UNRESOLVED" ]; then UNRESOLVED=$(section "open questions" "$STATE_FILE"); fi
+
+# --------------------------------------------------------------------------
+# 3. last session -- date and entry count from the newest session log.
+# --------------------------------------------------------------------------
+SESSION_LINE=
+if [ -d "$EVE_HOME/sessions" ]; then
+	NEWEST=$(find "$EVE_HOME/sessions" -type f -name '*.md' 2>/dev/null | sort | tail -n 1 || true)
+	if [ -n "$NEWEST" ] && [ -f "$NEWEST" ]; then
+		SDATE=$(basename "$NEWEST" .md)
+		SCOUNT=$(grep -c '^[^#[:space:]]' "$NEWEST" 2>/dev/null || printf '0')
+		SCOUNT=$(front_trim "$SCOUNT")
+		case $SCOUNT in
+		'' | *[!0-9]*) SCOUNT=0 ;;
+		esac
+		if [ "$SCOUNT" -gt 0 ]; then
+			SESSION_LINE="- Last session $SDATE: $SCOUNT entries"
+		fi
+	fi
+fi
+
+# --------------------------------------------------------------------------
+# assemble
+# --------------------------------------------------------------------------
+BODY=
+add() {
+	if [ -z "$1" ]; then return 0; fi
+	if [ -z "$BODY" ]; then BODY=$1; else BODY=$(printf '%s\n%s' "$BODY" "$1"); fi
+}
+
+add "$ACTIVITY"
+if [ -n "$IN_FLIGHT" ]; then add "- In flight: $IN_FLIGHT"; fi
+if [ -n "$UNRESOLVED" ]; then add "- Unresolved: $UNRESOLVED"; fi
+add "$SESSION_LINE"
+add "$APPS"
+
+# Nothing observed is a legitimate outcome: say nothing rather than assert a
+# stale "current focus". A confidently wrong brief is worse than no brief.
+if [ -z "$BODY" ]; then exit 0; fi
+
+HEADER="Where you left off -- last ${EVE_FRONT_HOURS}h of local activity, as of $(front_now_iso)."
+BRIEF=$(printf '%s\n%s\n' "$HEADER" "$BODY")
+
+# Angle brackets are replaced because this text is injected into a tagged block
+# in the model's context, and a file path is attacker-influenceable in a way
+# the rest of the brief is not. A path can never close the block.
+BRIEF=$(printf '%s' "$BRIEF" | tr '<>' '()')
+
+# Drop whole lines from the bottom until the budget is met. Never truncate a
+# line mid-sentence: half a fact reads like a whole one.
+BRIEF=$(printf '%s\n' "$BRIEF" | awk -v max="$EVE_FRONT_MAX_CHARS" '
+	{ n += length($0) + 1; if (n > max) exit; print }
+')
+# A header with no facts under it is worse than silence: it spends context to
+# say "here is a briefing" and then briefs nothing.
+if [ "$(printf '%s\n' "$BRIEF" | wc -l | tr -d ' ')" -lt 2 ]; then exit 0; fi
+
+# --------------------------------------------------------------------------
+# optional composer
+#
+# Runs here, in the sampler/cron context -- never on the hook path. The hook
+# only reads the finished file, so a slow or hung model cannot delay a prompt.
+# Failure is not an error: the deterministic brief stands.
+# --------------------------------------------------------------------------
+if [ "$USE_COMPOSER" -eq 1 ] && [ -n "$EVE_FRONT_COMPOSER" ]; then
+	if [ -x "${EVE_FRONT_COMPOSER%% *}" ] || front_have "${EVE_FRONT_COMPOSER%% *}"; then
+		COMPOSED=$(printf '%s\n' "$BRIEF" | sh -c "$EVE_FRONT_COMPOSER" 2>/dev/null || true)
+		COMPOSED=$(printf '%s' "$COMPOSED" | tr '<>' '()')
+		COMPOSED=$(printf '%s\n' "$COMPOSED" | awk -v max="$EVE_FRONT_MAX_CHARS" '
+			{ n += length($0) + 1; if (n > max) exit; print }
+		')
+		if [ -n "$COMPOSED" ]; then BRIEF=$COMPOSED; fi
+	fi
+fi
+
+if [ "$DO_WRITE" -eq 1 ]; then
+	mkdir -p "$EVE_STATE_DIR" 2>/dev/null || true
+	TMP=$(front_tmp "$EVE_STATE_DIR" 2>/dev/null || printf '')
+	if [ -n "$TMP" ]; then
+		printf '%s\n' "$BRIEF" >"$TMP" 2>/dev/null &&
+			mv "$TMP" "$EVE_BRIEF_FILE" 2>/dev/null ||
+			rm -f "$TMP" 2>/dev/null || true
+	fi
+fi
+
+if [ "$QUIET" -eq 0 ]; then printf '%s\n' "$BRIEF"; fi
+exit 0

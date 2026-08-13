@@ -1,0 +1,6 @@
+# Python bytecode from kb/lib. Regenerated on every run; never useful to commit.
+__pycache__/
+*.pyc
+
+# Atomic write temporaries. Only present if a write was interrupted.
+*.kbtmp

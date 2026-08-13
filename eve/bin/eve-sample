@@ -1,0 +1,373 @@
+#!/bin/sh
+# eve-sample -- the Eve activity sampler.
+#
+# CONSUMER: eve-brief, via $EVE_HOME/state/activity.log. If you turn the brief
+# off, turn this off too. A sampler whose log nothing reads is a write-only
+# producer: it reports healthy activity and changes nothing.
+#
+# WHAT IT RECORDS, exhaustively:
+#   - repository-relative paths of files that changed under a root you listed
+#   - the current git branch, uncommitted-file count and short commit id
+#   - optionally (off by default, macOS only) the name of the frontmost app
+#
+# WHAT IT NEVER RECORDS: file contents, diffs, window titles, URLs, keystrokes,
+# clipboard, screenshots, commit messages, or anything outside the roots you
+# listed. It makes no network calls. Everything stays under $EVE_HOME/state.
+#
+# It only reports changes that happened while it was running: the first run
+# creates a marker file and reports nothing; every later run reports files
+# newer than that marker. There is no retroactive scan of your disk, ever.
+#
+# Usage: eve-sample [--root DIR]... [--verbose] [--dry-run]
+#
+#   --root DIR    sample DIR in addition to EVE_SAMPLE_ROOTS (repeatable)
+#   --verbose     echo emitted lines to stdout
+#   --dry-run     print what would be logged; write nothing, move no marker
+#
+# POSIX sh. No bash 4 syntax, no timeout(1), no eval.
+
+set -eu
+
+SELF=$0
+_hops=0
+while [ -L "$SELF" ] && [ "$_hops" -lt 10 ]; do
+	_target=$(readlink "$SELF" 2>/dev/null) || break
+	case $_target in
+	/*) SELF=$_target ;;
+	*) SELF=$(dirname "$SELF")/$_target ;;
+	esac
+	_hops=$((_hops + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
+
+if [ -f "$SELF_DIR/front-common.sh" ]; then
+	. "$SELF_DIR/front-common.sh"
+elif [ -f "$SELF_DIR/../lib/front-common.sh" ]; then
+	. "$SELF_DIR/../lib/front-common.sh"
+elif [ -f "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh" ]; then
+	. "${EVE_HOME:-$HOME/.eve}/bin/front-common.sh"
+else
+	exit 0 # degrade silently: a background sampler must never be noisy
+fi
+
+VERBOSE=0
+DRY_RUN=0
+EXTRA_ROOTS=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--root)
+		if [ $# -lt 2 ]; then
+			front_warn "eve-sample: --root needs a directory"
+			exit 64
+		fi
+		EXTRA_ROOTS="$EXTRA_ROOTS$2:"
+		shift 2
+		;;
+	--verbose | -v)
+		VERBOSE=1
+		shift
+		;;
+	--dry-run | -n)
+		DRY_RUN=1
+		VERBOSE=1
+		shift
+		;;
+	-h | --help)
+		sed -n '2,28p' "$SELF" | sed 's/^#\{1,\} \{0,1\}//'
+		exit 0
+		;;
+	*)
+		front_warn "eve-sample: unknown option: $1"
+		exit 64
+		;;
+	esac
+done
+
+front_cfg_load
+
+if [ "$EVE_DISABLE" = "1" ]; then exit 0; fi
+
+case $EVE_SAMPLE_PATHS in
+full | dirs | count) ;;
+*) EVE_SAMPLE_PATHS=full ;;
+esac
+
+ROOTS="$EXTRA_ROOTS$EVE_SAMPLE_ROOTS"
+# Watching nothing is the default state, not an error.
+case $(printf '%s' "$ROOTS" | tr -d ':') in
+'') exit 0 ;;
+esac
+
+if [ ! -d "$EVE_HOME" ]; then exit 0; fi
+mkdir -p "$EVE_STATE_DIR" 2>/dev/null || exit 0
+
+# --------------------------------------------------------------------------
+# lock -- mkdir is atomic on every filesystem this runs on. Two samplers
+# overlapping would interleave lines into the log and double-move the marker.
+# --------------------------------------------------------------------------
+LOCK="$EVE_STATE_DIR/sampler.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+	LOCK_AGE=$(($(front_now_epoch) - $(front_file_mtime "$LOCK")))
+	if [ "$LOCK_AGE" -gt 600 ]; then
+		rmdir "$LOCK" 2>/dev/null || true
+		mkdir "$LOCK" 2>/dev/null || exit 0
+	else
+		if [ "$VERBOSE" -eq 1 ]; then front_warn "eve-sample: another sampler holds the lock"; fi
+		exit 0
+	fi
+fi
+cleanup() { rmdir "$LOCK" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+NOW_EPOCH=$(front_now_epoch)
+NOW_ISO=$(front_now_iso)
+STAT_STYLE=$(front_stat_style "$EVE_STATE_DIR")
+
+FIND_MAXDEPTH=0
+if find . -maxdepth 0 >/dev/null 2>&1; then FIND_MAXDEPTH=1; fi
+
+# --------------------------------------------------------------------------
+# emit -- one line per observation, tab-separated:
+#
+#   epoch <TAB> iso8601 <TAB> kind <TAB> scope <TAB> payload...
+#
+#   kind=git    payload: branch <TAB> dirty-count <TAB> short-sha
+#   kind=files  payload: count <TAB> path <TAB> path ...   (root-relative)
+#   kind=app    payload: application name                  (scope is "-")
+#
+# One writer, one file: nothing else appends to activity.log.
+# --------------------------------------------------------------------------
+emit() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s\t%s\t%s\n' "$NOW_EPOCH" "$NOW_ISO" "$1"
+		return 0
+	fi
+	printf '%s\t%s\t%s\n' "$NOW_EPOCH" "$NOW_ISO" "$1" >>"$EVE_ACTIVITY_LOG"
+	if [ "$VERBOSE" -eq 1 ]; then
+		printf '%s\t%s\t%s\n' "$NOW_EPOCH" "$NOW_ISO" "$1"
+	fi
+	return 0
+}
+
+# last_payload KIND SCOPE -- payload of the most recent matching line, so
+# unchanged state is not re-logged every interval. The log is a change log:
+# 2,000 lines cover months of real use, not two days.
+last_payload() {
+	if [ ! -f "$EVE_ACTIVITY_LOG" ]; then return 0; fi
+	tail -n 400 "$EVE_ACTIVITY_LOG" 2>/dev/null |
+		awk -F '\t' -v k="$1" -v s="$2" '
+			$3 == k && $4 == s {
+				p = ""
+				for (i = 5; i <= NF; i++) p = p (i > 5 ? "\t" : "") $i
+				last = p
+			}
+			END { if (last != "") print last }
+		' || true
+}
+
+# --------------------------------------------------------------------------
+# git signals
+#
+# Without the git binary we still read .git/HEAD, which gives the branch for
+# the common non-detached case and costs one file read.
+# --------------------------------------------------------------------------
+sample_git() {
+	sg_root=$1
+	sg_label=$2
+	if [ ! -e "$sg_root/.git" ]; then return 0; fi
+
+	sg_branch=
+	sg_dirty=0
+	sg_sha=-
+
+	if front_have git; then
+		sg_branch=$(git -C "$sg_root" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '')
+		sg_sha=$(git -C "$sg_root" rev-parse --short HEAD 2>/dev/null || printf '-')
+		# head bounds a pathological working tree: the count is capped, the
+		# fact that it is dirty is not.
+		sg_dirty=$(git -C "$sg_root" status --porcelain 2>/dev/null | head -n 500 | wc -l | tr -d ' ')
+	fi
+	if [ -z "$sg_branch" ]; then
+		if [ -f "$sg_root/.git/HEAD" ]; then
+			sg_branch=$(sed -n 's|^ref: refs/heads/||p' "$sg_root/.git/HEAD" 2>/dev/null | head -n 1)
+			if [ -z "$sg_branch" ]; then sg_branch=detached; fi
+			sg_dirty=-
+		else
+			return 0
+		fi
+	fi
+	case $sg_dirty in
+	'' | *[!0-9]*)
+		if [ "$sg_dirty" != "-" ]; then sg_dirty=0; fi
+		;;
+	esac
+	sg_branch=$(printf '%s' "$sg_branch" | front_tsv_clean)
+
+	sg_new=$(printf '%s\t%s\t%s' "$sg_branch" "$sg_dirty" "$sg_sha")
+	if [ "$sg_new" = "$(last_payload git "$sg_label")" ]; then return 0; fi
+	emit "$(printf 'git\t%s\t%s' "$sg_label" "$sg_new")"
+}
+
+# --------------------------------------------------------------------------
+# file signals -- paths only, root-relative, most recently modified first.
+#
+# EVE_SAMPLE_PATHS controls granularity:
+#   full   src/api/manifest.go     (default)
+#   dirs   src/api                 (directory only -- filenames can leak)
+#   count  no paths at all, just how many files changed
+# --------------------------------------------------------------------------
+sample_files() {
+	sf_root=$1
+	sf_label=$2
+	# No marker means this is the first run: record nothing, scan nothing.
+	if [ ! -f "$EVE_SAMPLE_MARKER" ]; then return 0; fi
+	if [ "$STAT_STYLE" = none ]; then return 0; fi
+
+	# Build the find expression in positional parameters. No eval, so an entry
+	# in the ignore list is never interpreted by the shell.
+	sf_ign=
+	sf_oifs=$IFS
+	IFS=:
+	set -f
+	for sf_d in $EVE_SAMPLE_IGNORE; do
+		if [ -n "$sf_d" ]; then sf_ign="$sf_ign$sf_d:"; fi
+	done
+	set +f
+	IFS=$sf_oifs
+
+	set -- "$sf_root"
+	if [ "$FIND_MAXDEPTH" -eq 1 ]; then set -- "$@" -maxdepth "$EVE_SAMPLE_MAX_DEPTH"; fi
+	if [ -n "$sf_ign" ]; then
+		set -- "$@" '('
+		sf_first=1
+		sf_oifs=$IFS
+		IFS=:
+		set -f
+		for sf_d in $sf_ign; do
+			if [ -z "$sf_d" ]; then continue; fi
+			if [ "$sf_first" -ne 1 ]; then set -- "$@" -o; fi
+			set -- "$@" -name "$sf_d"
+			sf_first=0
+		done
+		set +f
+		IFS=$sf_oifs
+		set -- "$@" ')' -prune -o
+	fi
+	# -type f skips symlinks, and find does not follow them without -L, which
+	# is never passed. A link inside a root cannot walk out of it.
+	set -- "$@" -type f -newer "$EVE_SAMPLE_MARKER" -print0
+
+	if [ "$STAT_STYLE" = gnu ]; then
+		sf_list=$(find "$@" 2>/dev/null | xargs -0 stat -c '%Y %n' 2>/dev/null |
+			sort -k1,1rn -k2 | head -n "$EVE_SAMPLE_MAX_PATHS" || true)
+	else
+		sf_list=$(find "$@" 2>/dev/null | xargs -0 stat -f '%m %N' 2>/dev/null |
+			sort -k1,1rn -k2 | head -n "$EVE_SAMPLE_MAX_PATHS" || true)
+	fi
+	if [ -z "$sf_list" ]; then return 0; fi
+
+	sf_count=$(printf '%s\n' "$sf_list" | grep -c '^[0-9]' || true)
+	case $sf_count in
+	'' | *[!0-9]*) sf_count=0 ;;
+	esac
+	if [ "$sf_count" -eq 0 ]; then return 0; fi
+
+	if [ "$EVE_SAMPLE_PATHS" = count ]; then
+		emit "$(printf 'files\t%s\t%s' "$sf_label" "$sf_count")"
+		return 0
+	fi
+
+	sf_paths=
+	sf_seen=
+	# Read from a here-document, not a pipe: a pipeline runs this loop in a
+	# subshell and sf_paths would not survive it.
+	while IFS= read -r sf_line; do
+		case $sf_line in
+		[0-9]*) ;;
+		*) continue ;;
+		esac
+		sf_p=${sf_line#* }
+		if [ -z "$sf_p" ]; then continue; fi
+		sf_rel=${sf_p#"$sf_root"/}
+		if [ -z "$sf_rel" ]; then continue; fi
+		if [ "$EVE_SAMPLE_PATHS" = dirs ]; then
+			case $sf_rel in
+			*/*) sf_rel=${sf_rel%/*} ;;
+			*) sf_rel=. ;;
+			esac
+			case ":$sf_seen:" in
+			*":$sf_rel:"*) continue ;;
+			esac
+			sf_seen="$sf_seen:$sf_rel"
+		fi
+		sf_rel=$(printf '%s' "$sf_rel" | front_tsv_clean)
+		sf_paths=$(printf '%s\t%s' "$sf_paths" "$sf_rel")
+	done <<EOF
+$sf_list
+EOF
+
+	if [ -z "$sf_paths" ]; then return 0; fi
+	emit "$(printf 'files\t%s\t%s%s' "$sf_label" "$sf_count" "$sf_paths")"
+}
+
+# --------------------------------------------------------------------------
+# frontmost application -- opt-in, macOS only, NAME ONLY.
+#
+# We deliberately do not read window titles. A window title is the name of the
+# document, the subject of the message, or the page you are reading; an app
+# name is "you were in a terminal". The second is enough to write a useful
+# brief and does not turn the log into a record of what you looked at.
+#
+# On first use macOS shows an Automation consent prompt. Decline it and this
+# records nothing, forever, with no other effect on Eve.
+# --------------------------------------------------------------------------
+sample_app() {
+	if [ "$EVE_SAMPLE_APPS" != "1" ]; then return 0; fi
+	if [ "$(uname -s 2>/dev/null || printf unknown)" != "Darwin" ]; then return 0; fi
+	if ! front_have osascript; then return 0; fi
+
+	sa_name=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || printf '')
+	sa_name=$(printf '%s' "$sa_name" | front_tsv_clean)
+	if [ -z "$sa_name" ]; then return 0; fi
+	if [ "$sa_name" = "$(last_payload app -)" ]; then return 0; fi
+	emit "$(printf 'app\t-\t%s' "$sa_name")"
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+OIFS=$IFS
+IFS=:
+set -f
+set -- $ROOTS
+set +f
+IFS=$OIFS
+
+for ROOT in "$@"; do
+	if [ -z "$ROOT" ]; then continue; fi
+	if [ "$ROOT" = "/" ]; then continue; fi # never walk the whole filesystem
+	if [ ! -d "$ROOT" ]; then continue; fi
+	ROOT=$(front_abs_path "$ROOT")
+	if [ "$ROOT" = "$HOME" ]; then continue; fi # never walk the whole home dir
+	LABEL=$(basename "$ROOT" | front_tsv_clean)
+	if [ -z "$LABEL" ]; then continue; fi
+
+	if [ "$EVE_SAMPLE_GIT" = "1" ]; then sample_git "$ROOT" "$LABEL"; fi
+	if [ "$EVE_SAMPLE_FILES" = "1" ]; then sample_files "$ROOT" "$LABEL"; fi
+done
+
+sample_app
+
+if [ "$DRY_RUN" -eq 0 ]; then
+	# The marker defines "since when" for the next run. Touch it last: a crash
+	# mid-sample then means the next run re-reports, rather than loses.
+	if : >"$EVE_SAMPLE_MARKER.new" 2>/dev/null; then
+		mv "$EVE_SAMPLE_MARKER.new" "$EVE_SAMPLE_MARKER" 2>/dev/null || true
+	fi
+	front_trim_file "$EVE_ACTIVITY_LOG" "$EVE_SAMPLE_LOG_MAX_LINES"
+fi
+
+exit 0

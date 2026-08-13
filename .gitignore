@@ -1,0 +1,86 @@
+# --- local state -----------------------------------------------------------
+# Nothing Eve generates at runtime belongs in the repo. If one of these paths
+# shows up in `git status`, something wrote into the clone that should have
+# written into $EVE_HOME.
+# Anchored to the repo root on purpose. An unanchored pattern here would also
+# match a file of the same name inside templates/ or docs/, which is source.
+# Only names that are unambiguously runtime state are listed: `memory/` and
+# `INDEX.md` are deliberately absent, because those names are source in this
+# repo and a .gitignore that hides source is worse than one that misses a
+# scratch file.
+/state/
+/sessions/
+/mirrors/
+/agents.conf
+/guard-patterns
+/config.local
+/.eve/
+
+# --- logs ------------------------------------------------------------------
+*.log
+logs/
+
+# --- backups and editor leftovers ------------------------------------------
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+*.tmp
+*.eve-tmp
+*.eve-preuninstall
+
+# --- databases and secrets -------------------------------------------------
+# The default engine has no index. The optional sqlite engine builds one under
+# $EVE_HOME/state, but a stray db in the clone is a mistake worth catching.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+*.pem
+*.key
+
+# --- test scratch ----------------------------------------------------------
+tests/tmp/
+tests/out/
+.eve-test/
+tmp/
+
+# --- macOS -----------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.DocumentRevisions-V100
+# AppleDouble resource forks. Copying this repo onto a non-HFS volume (exFAT,
+# FAT32, many USB sticks and network shares) creates a ._name file beside every
+# real file. They are not source, they confuse `git status`, and on some volumes
+# they make git operations fail outright. Strip them with:
+#   find . -name '._*' -delete
+._*
+
+# --- Windows / Linux -------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.directory
+*~lock*
+
+# --- editors and tooling ---------------------------------------------------
+.idea/
+.vscode/
+*.code-workspace
+.claude/settings.local.json
+node_modules/
+__pycache__/
+*.pyc

@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/you/.eve/hooks/eve-recall.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/you/.eve/hooks/eve-session-start.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/you/.eve/hooks/eve-session-end.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the Eve activity sampler (macOS).
+
+  Placeholders, all filled in by `eve-front sampler plist`:
+    __LABEL__      job label, e.g. local.eve.sampler
+    __EVE_BIN__    absolute path to $EVE_HOME/bin
+    __EVE_HOME__   absolute path to $EVE_HOME
+    __INTERVAL__   seconds between samples (600 = every 10 minutes)
+    __LOG__        file that receives stderr
+
+  Install:
+    eve-front sampler plist > ~/Library/LaunchAgents/__LABEL__.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/__LABEL__.plist
+
+  Uninstall (leaves every memory and every log in place):
+    launchctl bootout gui/$(id -u)/__LABEL__
+    rm ~/Library/LaunchAgents/__LABEL__.plist
+
+  RunAtLoad is false on purpose: the first run after a reboot has nothing
+  useful to say, and a login-time job that touches disk is a bad neighbour.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>__EVE_BIN__/eve-sample</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>EVE_HOME</key>
+		<string>__EVE_HOME__</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+	</dict>
+
+	<key>StartInterval</key>
+	<integer>__INTERVAL__</integer>
+
+	<key>RunAtLoad</key>
+	<false/>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<key>StandardErrorPath</key>
+	<string>__LOG__</string>
+</dict>
+</plist>
