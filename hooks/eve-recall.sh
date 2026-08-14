@@ -87,14 +87,22 @@ SEEN_FILE="$EVE_STATE_DIR/seen-$SID"
 
 # Cross-turn dedupe. In a focused conversation the same two or three files
 # match every single prompt, and re-injecting them on every turn is a real,
-# measurable context cost for zero new information. The window slides: the last
-# 12 basenames are excluded, 40 are retained, so a file becomes recallable
-# again a few turns after it was last shown rather than being suppressed for
-# the whole session.
+# measurable context cost for zero new information. The window slides:
+# recently-shown basenames are excluded, 40 are retained, so a file becomes
+# recallable again a few turns after it was last shown rather than being
+# suppressed for the whole session.
+# The window is capped at half the store, because a fixed 12 silences a small
+# store completely: with five memories, five turns fill the window and every
+# later turn in that session recalls nothing. A new store is exactly the case
+# where recall has to keep working, so the cap scales with what exists.
 EXCLUDE=''
 if [ -r "$SEEN_FILE" ]; then
-	EXCLUDE=$(tail -12 "$SEEN_FILE" 2>/dev/null | tr '\n' ',' 2>/dev/null) || EXCLUDE=''
-	EXCLUDE=${EXCLUDE%,} # trailing comma, stripped without another process
+	_win=$(($(eve_store_count) / 2))
+	[ "$_win" -gt 12 ] && _win=12
+	if [ "$_win" -gt 0 ]; then
+		EXCLUDE=$(tail -"$_win" "$SEEN_FILE" 2>/dev/null | tr '\n' ',' 2>/dev/null) || EXCLUDE=''
+		EXCLUDE=${EXCLUDE%,} # trailing comma, stripped without another process
+	fi
 fi
 
 OUT=$(eve_recall "$QUERY" "$EVE_RECALL_LIMIT" "$EXCLUDE" hook)

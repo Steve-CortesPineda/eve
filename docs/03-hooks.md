@@ -218,10 +218,18 @@ non-sequitur.
 
 **Cross-turn dedupe.** In a focused conversation the same two or three files
 match every single prompt. Re-injecting them on every turn is a real, measurable
-context cost for zero new information. The window slides: the last 12 basenames
-in `state/seen-<session_id>` are excluded, 40 are retained, so a file becomes
-recallable again a few turns after it was last shown rather than being
+context cost for zero new information. The window slides: recently-shown
+basenames in `state/seen-<session_id>` are excluded, 40 are retained, so a file
+becomes recallable again a few turns after it was last shown rather than being
 suppressed for the whole session.
+
+The window is **half the store, capped at 12** — not a fixed 12. This matters
+more than it looks. A fixed window silences a small store outright: with five
+memories, five turns fill the window and every later turn in that session
+recalls nothing at all. A new store is exactly the case where recall has to keep
+working, and it is exactly the case where a user concludes the tool is broken
+and uninstalls it. Measured before the cap was added: hits on turns 1-5, silence
+from turn 6 onward. After: hits on all eight.
 
 The trailing `[path]` on each hit line is how the hook knows what it showed. It
 is a parsed field, and its shape is frozen — see the injection format in the

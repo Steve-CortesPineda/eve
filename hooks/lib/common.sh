@@ -214,6 +214,22 @@ eve_disabled() {
 # a question the shell can answer with none. When the glob matches nothing the
 # shell leaves the pattern itself in $_eve_f and the -f test fails, which is the
 # answer we want. The store is flat by contract, so a glob is also complete.
+eve_store_count() {
+	_eve_n=0
+	[ -d "$EVE_MEMORY_DIR" ] || {
+		printf '0'
+		return 0
+	}
+	for _eve_f in "$EVE_MEMORY_DIR"/*.md; do
+		[ -f "$_eve_f" ] || continue
+		case "${_eve_f##*/}" in
+		TEMPLATE.md | MEMORY.md | INDEX.md | README.md) continue ;;
+		esac
+		_eve_n=$((_eve_n + 1))
+	done
+	printf '%s' "$_eve_n"
+}
+
 eve_store_ready() {
 	[ -d "$EVE_MEMORY_DIR" ] || return 1
 	for _eve_f in "$EVE_MEMORY_DIR"/*.md; do
