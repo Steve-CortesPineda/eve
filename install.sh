@@ -202,6 +202,19 @@ install_file() {
 	return 0
 }
 
+# Report a successful install_file. install_file returns 0 on a dry run without
+# writing anything, so every caller has to say "would install" in that case --
+# and four call sites each remembering to do that is four chances to forget.
+# Three of them did forget, and `--dry-run` printed "installed ..." for files it
+# had not touched, immediately above "Nothing was written."
+note_installed() { # DST [SUFFIX]
+	if [ "$DRY_RUN" -eq 1 ]; then
+		note "would install $1${2:+ $2}"
+	else
+		note "installed $1${2:+ $2}"
+	fi
+}
+
 # JSON string escaping for a filesystem path.
 json_escape() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
@@ -329,8 +342,12 @@ for d in memory sessions state mirrors bin hooks; do
 	if [ -d "$EVE_HOME/$d" ]; then
 		note "ok       $EVE_HOME/$d"
 	else
+		# mkdirp already prints "would create" on a dry run. A second line
+		# saying "created" would then contradict it two lines above the
+		# closing "Nothing was written", and the only way to find out which
+		# half is true is to diff the filesystem.
 		mkdirp "$EVE_HOME/$d"
-		note "created  $EVE_HOME/$d"
+		[ "$DRY_RUN" -eq 1 ] || note "created  $EVE_HOME/$d"
 	fi
 done
 
@@ -369,11 +386,7 @@ copy_tree() { # SRCDIR DSTDIR
 		esac
 		if [ -x "$_f" ]; then _m=755; else _m=644; fi
 		if install_file "$_f" "$_dstdir/$_rel" "$_m"; then
-			if [ "$DRY_RUN" -eq 1 ]; then
-				note "would install $_dstdir/$_rel"
-			else
-				note "installed $_dstdir/$_rel"
-			fi
+			note_installed "$_dstdir/$_rel"
 			copied=$((copied + 1))
 		else
 			_rc=$?
@@ -404,19 +417,19 @@ copy_tree "$REPO_DIR/templates" "$EVE_HOME/templates"
 # them (docs/05-design-laws.md, law 2).
 if [ ! -f "$EVE_HOME/bin/eve-doctor" ] && [ -f "$REPO_DIR/scripts/doctor.sh" ]; then
 	if install_file "$REPO_DIR/scripts/doctor.sh" "$EVE_HOME/bin/eve-doctor" 755; then
-		note "installed $EVE_HOME/bin/eve-doctor (from scripts/doctor.sh)"
+		note_installed "$EVE_HOME/bin/eve-doctor" "(from scripts/doctor.sh)"
 	fi
 fi
 if [ -f "$REPO_DIR/scripts/sync-agents.sh" ]; then
 	if install_file "$REPO_DIR/scripts/sync-agents.sh" "$EVE_HOME/bin/eve-sync-agents" 755; then
-		note "installed $EVE_HOME/bin/eve-sync-agents"
+		note_installed "$EVE_HOME/bin/eve-sync-agents"
 	fi
 fi
 # The scaffolder. `eve add` execs this rather than reimplementing template
 # rendering, so there is exactly one copy of that logic to fix.
 if [ -f "$REPO_DIR/scripts/new-memory.sh" ]; then
 	if install_file "$REPO_DIR/scripts/new-memory.sh" "$EVE_HOME/bin/eve-new-memory" 755; then
-		note "installed $EVE_HOME/bin/eve-new-memory"
+		note_installed "$EVE_HOME/bin/eve-new-memory"
 	fi
 fi
 
@@ -477,18 +490,18 @@ EVE_BRIEF_MAX_CHARS=800
 EVE_ENGINE=awk
 EVE_DEBUG=0
 CFG
+		note "created  $EVE_HOME/config (built-in defaults; no config template in this clone)"
+	else
+		note "would create $EVE_HOME/config (built-in defaults; no config template in this clone)"
 	fi
-	note "created  $EVE_HOME/config (built-in defaults; no config template in this clone)"
 fi
 
 # The blank memory template, so `eve add` and scripts/new-memory.sh have
 # something to render. Never overwritten: if you have edited your template,
 # that edit is the point.
 if [ -f "$REPO_DIR/memory/TEMPLATE.md" ] && [ ! -f "$EVE_HOME/memory/TEMPLATE.md" ]; then
-	if [ "$DRY_RUN" -eq 1 ]; then
-		note "would install $EVE_HOME/memory/TEMPLATE.md"
-	elif install_file "$REPO_DIR/memory/TEMPLATE.md" "$EVE_HOME/memory/TEMPLATE.md" 644; then
-		note "installed $EVE_HOME/memory/TEMPLATE.md"
+	if install_file "$REPO_DIR/memory/TEMPLATE.md" "$EVE_HOME/memory/TEMPLATE.md" 644; then
+		note_installed "$EVE_HOME/memory/TEMPLATE.md"
 	fi
 fi
 
@@ -779,6 +792,59 @@ if [ "$DRY_RUN" -eq 1 ]; then
 	exit 0
 fi
 say "Eve is installed at $EVE_HOME"
+say ""
+
+# PATH.
+#
+# Every example in the README and the docs is written as a bare `eve search`,
+# so an installer that silently leaves $EVE_HOME/bin off PATH has shipped a
+# manual for a command the reader does not have. That gap used to be filled by
+# the reader assuming the install failed.
+#
+# Nothing is appended to a startup file here. That file is the user's, an
+# installer that edits it unasked is one you stop trusting, and a bad line in
+# it breaks every future shell. So this prints the exact line and the exact
+# file, and the reader pastes it -- or ignores it and uses the full path,
+# which is why the full path is printed first.
+case ":${PATH:-}:" in
+*":$EVE_HOME/bin:"*)
+	say "PATH: ok -- $EVE_HOME/bin is already on your PATH,"
+	say "      so the bare 'eve ...' examples in the docs will resolve."
+	;;
+*)
+	_sh=${SHELL:-}
+	_sh=${_sh##*/}
+	case "$_sh" in
+	zsh) _rc="$HOME/.zshrc" ;;
+	bash) if [ "$(uname -s)" = Darwin ]; then _rc="$HOME/.bash_profile"; else _rc="$HOME/.bashrc"; fi ;;
+	ksh) _rc="$HOME/.kshrc" ;;
+	*) _rc="" ;;
+	esac
+	say "PATH: $EVE_HOME/bin is NOT on your PATH, so the bare"
+	say "      'eve ...' examples in the docs will not resolve yet."
+	say ""
+	say "      Use the full path, which always works:"
+	say ""
+	say "        $EVE_HOME/bin/eve search \"your query\""
+	say ""
+	if [ "$_sh" = fish ]; then
+		say "      Or add it once (fish), then open a new terminal:"
+		say ""
+		say "        fish_add_path $EVE_HOME/bin"
+	else
+		if [ -n "$_rc" ]; then
+			say "      Or append this line to $(tilde "$_rc"), then open a new terminal:"
+		else
+			say "      Or append this line to your shell's startup file, then open a"
+			say "      new terminal:"
+		fi
+		say ""
+		say "        export PATH=\"$EVE_HOME/bin:\$PATH\""
+	fi
+	say ""
+	say "      Nothing was appended to your startup file. That file is yours."
+	;;
+esac
 say ""
 say "Next:"
 say "  1. Write your first memory -- the correction you have typed more than"

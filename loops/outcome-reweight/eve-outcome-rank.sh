@@ -11,16 +11,30 @@
 # by is the write-only producer in its purest form: a number computed every
 # night, stored forever, and multiplied by nothing.
 #
-# PRODUCER: you, recording how a decision turned out, in either place --
+# PRODUCER: `eve outcome`, which is you, with the YAML editing removed --
 #
-#   frontmatter:  outcome: worked | failed | mixed
-#                 outcome_date: 2026-05-02
+#   eve outcome drop-offset-pagination worked "duplicate-row reports went to zero"
+#   eve outcome drop-offset-pagination mixed  "one caller migrated by hand"
 #
-#   or a body section, which is better because it holds more than one verdict:
+# It appends to a body section, which is the shape that holds more than one
+# verdict and is therefore the one this loop is built around:
 #
 #     ## Outcomes
 #     - 2026-05-02 worked - duplicate-row reports went to zero.
 #     - 2026-06-18 mixed - one caller had to be migrated by hand.
+#
+# The single-valued frontmatter spelling is still read, so stores written
+# before the command existed keep ranking:
+#
+#   frontmatter:  outcome: worked | failed | mixed
+#                 outcome_date: 2026-05-02
+#
+# A (date, verdict) pair present in both places counts once. `eve outcome`
+# never writes or rewrites frontmatter: that field holds one verdict, and a
+# second check would have to erase the first to fit.
+#
+# `eve waiting` is the other half of the habit -- the same "waiting on reality"
+# list this script prints, available without running a loop at all.
 #
 # WRITES: $EVE_HOME/proposals/outcomes-<date>.md   (regenerable)
 #         $EVE_HOME/state/weights.tsv              (only with --write-weights)
@@ -165,9 +179,24 @@ for f in "$MEMDIR"/*.md; do
     # the report was well-formatted and confidently wrong, and the only clue
     # was that a file with two recorded failures showed "0 failed". Alternation
     # belongs in awk's ERE, where every awk agrees what it means.
+    #
+    # Fenced code and block comments are skipped, for the same reason with a
+    # different cause: a memory that documents this format contains a sample
+    # outcome line -- `eve add -t decision` writes a hint comment into every
+    # new decision -- and counting a sample as a verdict produces the same
+    # well-formatted wrong answer from the other direction. `eve outcome`
+    # skips them with the identical five lines; the two readers have to agree
+    # or the one you did not run is the one that was right.
+    #
+    # A comment that opens mid-line is left alone, so a trailing
+    # `<!-- checked by Rye -->` on a real outcome bullet still counts.
     awk '
       {
         line = $0
+        if (incom) { if (line ~ /-->/) incom = 0; next }
+        if (line ~ /^[ \t]*<!--/) { if (line !~ /-->/) incom = 1; next }
+        if (line ~ /^[ \t]*(```|~~~)/) { fence = 1 - fence; next }
+        if (fence) next
         sub(/^[ \t]+/, "", line)
         if (line !~ /^[-*][ \t]+/) next
         sub(/^[-*][ \t]+/, "", line)
@@ -290,17 +319,24 @@ report_md() {
     printf 'Every decision older than %s days has at least one recorded outcome.\n\n' "$STALE_DAYS"
   else
     printf 'Asserted, never checked. This is the actionable list: pick one, find out\n'
-    printf 'what happened, and add a line under `## Outcomes`.\n\n'
+    printf 'what happened, and record it.\n\n'
     printf '| id | age (days) | title |\n|---|---|---|\n'
     awk -F'\t' -v s="$STALE_DAYS" \
       '$10=="decision" && $3+$4+$5 == 0 && $8+0 > s {printf "| %s | %s | %s |\n", $1, $8, $9}' \
       "$TMP/ranked"
     printf '\n'
+    printf '```sh\n'
+    awk -F'\t' -v s="$STALE_DAYS" \
+      '$10=="decision" && $3+$4+$5 == 0 && $8+0 > s {printf "eve outcome %s worked|failed|mixed \"what you observed\"\n", $1}' \
+      "$TMP/ranked"
+    printf '```\n\n'
+    printf 'The same list, without running this loop: `eve waiting`.\n\n'
   fi
 
   printf '## What this loop will not do\n\n'
-  printf -- '- It will not edit a memory. Recording an outcome is a human act;\n'
-  printf '  something that guessed outcomes would be inventing evidence.\n'
+  printf -- '- It will not edit a memory. `eve outcome` writes the verdict you\n'
+  printf '  hand it and nothing anywhere derives one, because an outcome a\n'
+  printf '  program inferred is evidence a program invented.\n'
   printf -- '- It will not propose deleting anything, including a decision whose\n'
   printf '  every outcome is `failed`. That file is the reason nobody repeats it.\n'
   printf -- '- It will not weight below %s. A multiplier that can reach zero is a\n' '0.80'

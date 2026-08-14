@@ -1,0 +1,53 @@
+{
+  "name": "eve-recall",
+  "version": "1.0.0",
+  "description": "Give your coding agent a memory that survives the session. A curated store of markdown files, recalled automatically on every prompt. POSIX sh + awk; npm is only the delivery channel.",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "agent-memory",
+    "memory",
+    "hooks",
+    "context",
+    "grounding",
+    "hallucination",
+    "knowledge-base",
+    "cli"
+  ],
+  "homepage": "https://github.com/Steve-CortesPineda/eve#readme",
+  "bugs": {
+    "url": "https://github.com/Steve-CortesPineda/eve/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Steve-CortesPineda/eve.git"
+  },
+  "license": "MIT",
+  "author": "Steve-CortesPineda (https://github.com/Steve-CortesPineda)",
+  "bin": {
+    "eve-recall": "npm/cli.js"
+  },
+  "files": [
+    "bin/",
+    "hooks/",
+    "scripts/",
+    "templates/",
+    "memory/",
+    "eve/",
+    "loops/",
+    "kb/",
+    "prompts/",
+    "docs/",
+    "npm/",
+    ".claude-plugin/",
+    "install.sh",
+    "uninstall.sh",
+    "settings.example.json"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "!win32"
+  ]
+}

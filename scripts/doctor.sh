@@ -139,6 +139,99 @@ have_python3() {
 	python3 -c 'import json' >/dev/null 2>&1
 }
 
+# --------------------------------------------------------------------------
+# A clock for the live probe
+# --------------------------------------------------------------------------
+#
+# The doctor already runs the recall hook once. Timing that one call is nearly
+# free and turns an unmeasured claim ("the hook works") into a measured one
+# ("the hook works and it cost 84 ms"). It is deliberately NOT a benchmark:
+# one cold sample, no warm-up, no floor, no percentiles. It exists to catch the
+# machine where the hook takes 900 ms, and to send that person to `eve bench`.
+#
+# Budget: 250 ms. docs/03-hooks.md states the rule this defends -- a hook that
+# adds a second to every prompt gets uninstalled -- and 250 ms is a quarter of
+# that, tripped while the cost is still measurable rather than annoying.
+#
+# `date +%s%N` is tried FIRST here, unlike in eve-bench, and the difference is
+# on purpose. It costs two forks (~2 ms) against python3's ~30 ms of
+# interpreter startup, and the doctor's constraint is that it must not get
+# slower. eve-bench has the opposite constraint -- accuracy and a per-run
+# timeout -- so it prefers python3. Neither charges the timer's own startup to
+# the measurement.
+#
+# Older BSD and older macOS `date` have no %N: they exit 0 and print a literal
+# trailing "N", so an exit-status check passes and the arithmetic then silently
+# does nothing sensible. Newer Darwin does support it. Do not assume either way
+# -- check that what came back is all digits and long enough to be nanoseconds.
+DOCTOR_BUDGET_MS=250
+PROBE_CLOCK=none
+if _t=$(date +%s%N 2>/dev/null); then
+	case "$_t" in
+	'' | *[!0-9]*) ;;
+	*) [ "${#_t}" -ge 16 ] && PROBE_CLOCK=date ;;
+	esac
+fi
+if [ "$PROBE_CLOCK" = none ] && have_python3; then
+	PROBE_CLOCK=python
+fi
+
+# timed_probe IN OUT ERR  -> sets PROBE_RC and PROBE_MS (PROBE_MS empty if we
+# have no clock). Never fails the doctor: an unmeasurable probe is still a probe.
+timed_probe() {
+	PROBE_MS=''
+	case "$PROBE_CLOCK" in
+	date)
+		_t0=$(date +%s%N)
+		set +e
+		EVE_HOME="$EVE_HOME" sh "$RECALL" <"$1" >"$2" 2>"$3"
+		PROBE_RC=$?
+		set -e
+		_t1=$(date +%s%N)
+		PROBE_MS=$(((_t1 - _t0) / 1000000))
+		;;
+	python)
+		set +e
+		_r=$(python3 - "$RECALL" "$1" "$2" "$3" "$EVE_HOME" <<'PYEOF'
+import os, subprocess, sys, time
+hook, fin, fout, ferr, home = sys.argv[1:6]
+env = dict(os.environ); env["EVE_HOME"] = home
+with open(fin, "rb") as i, open(fout, "wb") as o, open(ferr, "wb") as e:
+    t = time.perf_counter()
+    rc = subprocess.call(["/bin/sh", hook], stdin=i, stdout=o, stderr=e, env=env)
+    ms = (time.perf_counter() - t) * 1000.0
+sys.stdout.write("%.0f %d\n" % (ms, rc))
+PYEOF
+		)
+		set -e
+		_ms=${_r%% *}
+		_rc=${_r#* }
+		case "$_ms" in '' | *[!0-9]*) _ms='' ;; esac
+		case "$_rc" in '' | *[!0-9]*) _rc='' ;; esac
+		if [ -n "$_ms" ] && [ -n "$_rc" ]; then
+			PROBE_MS=$_ms
+			PROBE_RC=$_rc
+		else
+			# python could not run it. Do NOT invent an exit status: the probe
+			# is the one check in this whole script that is a measurement, and
+			# a health check that reports a success it did not observe is worse
+			# than one that reports nothing. Run it plainly, unmeasured.
+			set +e
+			EVE_HOME="$EVE_HOME" sh "$RECALL" <"$1" >"$2" 2>"$3"
+			PROBE_RC=$?
+			set -e
+		fi
+		;;
+	*)
+		set +e
+		EVE_HOME="$EVE_HOME" sh "$RECALL" <"$1" >"$2" 2>"$3"
+		PROBE_RC=$?
+		set -e
+		;;
+	esac
+	return 0
+}
+
 printf 'eve-doctor\n'
 printf '  EVE_HOME:   %s\n' "$EVE_HOME"
 printf '  Claude dir: %s\n' "$CLAUDE_DIR"
@@ -307,7 +400,7 @@ printf '      %-24s %s\n' "EVE_RECALL_MIN_PROMPT" "$(cfg EVE_RECALL_MIN_PROMPT 1
 printf '      %-24s %s\n' "EVE_SNIPPET_CHARS" "$(cfg EVE_SNIPPET_CHARS 150)"
 printf '      %-24s %s\n' "EVE_CANDIDATE_CAP" "$(cfg EVE_CANDIDATE_CAP 300)"
 printf '      %-24s %s\n' "EVE_MAX_LINES" "$(cfg EVE_MAX_LINES 400)"
-printf '      %-24s %s\n' "EVE_MIN_SCORE" "$(cfg EVE_MIN_SCORE 6)"
+printf '      %-24s %s\n' "EVE_MIN_SCORE" "$(cfg EVE_MIN_SCORE 7)"
 printf '      %-24s %s\n' "EVE_BRIEF_MAX_CHARS" "$(cfg EVE_BRIEF_MAX_CHARS 800)"
 printf '      %-24s %s\n' "EVE_ENGINE" "$(cfg EVE_ENGINE awk)"
 printf '      %-24s %s\n' "EVE_DEBUG" "$(cfg EVE_DEBUG 0)"
@@ -400,6 +493,32 @@ if [ "$MEM_COUNT" -gt 0 ]; then
 		pass "$superseded memory(ies) marked superseded (kept, demoted, never deleted)"
 	fi
 
+	# Decisions nobody has been back to check.
+	#
+	# Printed, not scored. This is not a fault in the plumbing -- a decision
+	# made last week is supposed to be sitting there unanswered -- so it is
+	# neither a PASS nor a WARN, and it must never be able to turn the summary
+	# line red. It is here because the doctor is where people look, and the
+	# outcome habit is the one part of Eve that no script can perform for you.
+	if [ -x "$EVE_HOME/bin/eve" ]; then
+		wait_all=$(EVE_HOME="$EVE_HOME" "$EVE_HOME/bin/eve" waiting --format tsv 2>/dev/null | wc -l | tr -d ' ')
+		[ -n "$wait_all" ] || wait_all=0
+		if [ "$wait_all" -gt 0 ]; then
+			wait_old=$(EVE_HOME="$EVE_HOME" "$EVE_HOME/bin/eve" waiting --days 90 --format tsv 2>/dev/null | wc -l | tr -d ' ')
+			[ -n "$wait_old" ] || wait_old=0
+			printf '      %s decision(s) with no recorded outcome' "$wait_all"
+			if [ "$wait_old" -gt 0 ]; then
+				printf ', %s of them over 90 days old' "$wait_old"
+			fi
+			printf '\n'
+			printf '      the list, oldest first:  %s waiting\n' "$EVE_HOME/bin/eve"
+			if [ "$VERBOSE" -eq 1 ]; then
+				EVE_HOME="$EVE_HOME" "$EVE_HOME/bin/eve" waiting --limit 5 --format tsv 2>/dev/null |
+					awk -F'	' '{ printf "        %6s  %s\n", $1, $2 }'
+			fi
+		fi
+	fi
+
 	# INDEX.md freshness. mtime flags differ between BSD and GNU stat, so try
 	# both and give up quietly rather than guessing wrong.
 	file_mtime() {
@@ -454,10 +573,8 @@ else
 	printf '{"session_id":"%s","prompt":"%s","cwd":"%s"}' "$PROBE_SID" "$qesc" "$EVE_HOME" >"$TMPD/probe.json"
 
 	printf '      query: %s\n' "$q"
-	set +e
-	EVE_HOME="$EVE_HOME" sh "$RECALL" <"$TMPD/probe.json" >"$TMPD/probe.out" 2>"$TMPD/probe.err"
-	prc=$?
-	set -e
+	timed_probe "$TMPD/probe.json" "$TMPD/probe.out" "$TMPD/probe.err"
+	prc=$PROBE_RC
 
 	if [ "$prc" -ne 0 ]; then
 		fail "recall hook exited $prc" \
@@ -481,6 +598,22 @@ else
 	else
 		warn "recall produced no output for its own memory's title" \
 			"see the scores: $EVE_HOME/bin/eve search --query '$q' --format plain"
+	fi
+
+	# How long that one call took.
+	#
+	# One cold sample. It is not a benchmark and it says so: no warm-up, so the
+	# page cache is cold and this reads HIGH; no floor, so it cannot tell you
+	# whether the cost is your store or your shell; no percentiles, so it cannot
+	# see a tail. All it is good for is noticing that the number is wrong by an
+	# order of magnitude, which is the failure worth catching here.
+	if [ -n "${PROBE_MS:-}" ]; then
+		if [ "$PROBE_MS" -gt "$DOCTOR_BUDGET_MS" ]; then
+			warn "recall took ${PROBE_MS} ms on this one cold call; the budget for a per-prompt hook is ${DOCTOR_BUDGET_MS} ms" \
+				"one cold sample proves nothing on its own. Measure it properly: $EVE_HOME/bin/eve bench"
+		else
+			pass "recall returned in ${PROBE_MS} ms (one cold call, budget ${DOCTOR_BUDGET_MS} ms; p50/p95: $EVE_HOME/bin/eve bench)"
+		fi
 	fi
 
 	# Leave no trace: the probe writes a per-session dedupe file like any other

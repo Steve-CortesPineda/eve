@@ -1,0 +1,68 @@
+# .npmignore -- the second filter on what reaches the tarball.
+#
+# READ THIS BEFORE ADDING A RULE HERE.
+#
+# `files` in package.json is an allowlist, and npm gives it precedence: a path
+# inside a directory named in `files` CANNOT be excluded from here. Verified,
+# not assumed -- a `*.log` rule in this file did not stop
+# loops/example-store/state/whiffs.log from packing, because `loops/` is
+# allowlisted.
+#
+# So the two files divide up like this, and a rule in the wrong one is silently
+# a no-op:
+#
+#   to drop a whole tree        remove it from `files` in package.json
+#   to drop something npm adds  on its own initiative, or that could appear
+#                               inside an allowlisted tree on someone else's
+#                               machine (editor droppings, build artifacts,
+#                               a stray .tgz) -- here
+#
+# Either way, the only real check is the output, not the intent:
+#
+#   npm pack --dry-run
+#
+# ---------------------------------------------------------------------------
+# Not in `files`, restated so the reason survives
+# ---------------------------------------------------------------------------
+# These are already excluded by the allowlist. They are named here so that
+# widening `files` later does not quietly pull them in, and so the reason is
+# written down somewhere.
+#
+# evals/ is the fixture store and the scorers that grade a model against it.
+# It is how you check a change to the retrieval engine -- work you do from a
+# clone with the git history in front of you, not from node_modules. Cloning
+# gets you all of it.
+evals/
+CONTRIBUTING.md
+.github/
+
+# ---------------------------------------------------------------------------
+# Generated or machine-local, and could appear inside an allowlisted tree
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Editor, OS and backup droppings
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+*.swp
+*~
+*.bak
+*.orig
+*.rej
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Packaging and VCS housekeeping
+# ---------------------------------------------------------------------------
+.git/
+.gitattributes
+node_modules/
+*.tgz
+package-lock.json
+npm-debug.log*
+.npmrc

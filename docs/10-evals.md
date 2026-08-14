@@ -296,6 +296,132 @@ python3 evals/check_fixture.py    # is the fixture still internally consistent?
 
 ---
 
+## Second suite: retrieval recall
+
+Everything above measures whether an agent tells the truth about a corpus. It assumes the corpus reached the agent. That assumption is doing a lot of work, and it is the weaker half of the system.
+
+```sh
+sh evals/recall/run.sh
+```
+
+Same properties — offline, deterministic, no model, a few seconds — and a completely different question: **when the answer is in the store, does the store hand it over?**
+
+The two suites fail independently, which is why they are separate programs and separate scorecards. A perfect hallucination score sitting on top of a failed retrieval is an agent that honestly and correctly says "that isn't recorded" about something you wrote down last week. Nothing in the first suite can see that happen; its fixture is fourteen documents and everything fits in the context window, so retrieval there is nearly free. `Limits` item 3 below says exactly this and calls the failure `unretrievable`. This suite is the instrument for it.
+
+### The scorecard
+
+Run against `bin/eve` and the twelve-memory fixture in `evals/recall/fixture-store/`:
+
+```
+  tier           n      recall@1      recall@3   miss  misrank  MISFIRE
+  ------------------------------------------------------------------------
+  verbatim      12      12  100%      12  100%      0        0        0
+  paraphrase    20      10   50%      13   65%      5        3        2
+  disjoint       7       0    0%       0    0%      6        0        1
+  ------------------------------------------------------------------------
+  answerable    39      22   56%      25   64%     11        3        3
+  out-of-scope   6         (nothing to recall)      6                 0
+  ------------------------------------------------------------------------
+
+  MISFIRE RATE    3/45     7%   the right memory absent from a non-empty block
+  empty rate     17/45    38%   6 of them the out-of-scope controls, correctly silent
+```
+
+That is the committed baseline. It is not a good result and it is not meant to look like one — an honest bad number that moves is worth more than a good one that cannot.
+
+Read it as four separate statements:
+
+- **`verbatim` 100%.** Ask using the memory's own words and you always get it. This tier is a wiring check; if it is not 100% something is broken, not merely weak.
+- **`paraphrase` 50% at rank 1.** Real questions, asked the way you would actually type them mid-task. Half of them find the memory. This is the number that matters and the one to watch.
+- **`disjoint` 0%.** Queries sharing *no word at all* with the target. This is correct behaviour, not a bug, and the next section explains why.
+- **`out-of-scope` 6 of 6 silent.** Six questions nothing in the store answers, and it returned nothing for all six. Genuinely good, and worth as much as any of the recall numbers.
+
+### Why keyword retrieval has a ceiling, in arithmetic
+
+Eve scores a candidate once per **distinct query term** it matches, at the weight of the best field that term landed in: **title 6, filename 5, tag 4, body 4**, `+1` if the same term appears in more than one of them, all multiplied by a rarity weight and by coverage, against a relevance gate of `EVE_MIN_SCORE=7`. See [03 · Hooks](03-hooks.md#the-weights) for the full arithmetic.
+
+The ceiling that remains is not arithmetic, it is vocabulary. Two distinct body terms clear the gate comfortably, so the "Why:" and "How to apply:" sections are reachable. But **a memory that shares no word with the question cannot be found at any weighting.** Ask "clients report seeing the same record twice when scrolling" of a memory that says *offset pagination skipped rows under write load* and every term scores zero: there is nothing to weight. That is the real ceiling, and no tuning moves it — only rewriting the memory, or a different kind of index, does.
+
+A worked example from the fixture. The query *"is it safe to alter the table while people are working"* against a memory titled *"Schema migrations never run during business hours"* scores **1**. Six tokens survive stopword removal (`safe alter table while people working`); exactly one of them, `table`, appears in the memory, and it appears in the prose; `table` is common across the candidate set so its weight drops to a quarter, giving 0.5; coverage adds one sixth of 3, another 0.5. Total 1, against a gate of 6. The memory that answers the question is on disk, correct, and unreachable.
+
+The consequence is sharper than "recall is 50%". Splitting the paraphrase tier by *where* the overlap lands:
+
+| paraphrase queries whose overlap is… | recall@1 |
+| --- | --- |
+| in the title, filename or tags | **8/9 = 88%** |
+| only in the body prose | **2/11 = 18%** |
+
+The title is the memory. The body is decoration, as far as retrieval is concerned — and the body is where `**Why:**` and `**How to apply:**` live, which [chapter 02](02-memory-format.md) correctly calls the most valuable part of a memory. **The most valuable part of a memory is the least findable part.** That is a real, measured property of this design, not a tuning oversight, and it has one practical consequence worth acting on today: *write the conclusion into the title*, because the title is what retrieval can actually see. The `disjoint` tier exists to hold the rest of the gap open. Those seven queries share no token with their target, so the target never becomes a candidate at any gate setting; no amount of weight tuning reaches them. Their 0% is the ceiling of lexical matching. The day someone adds embeddings, a synonym table, or an LLM reranker, that row is the one that moves.
+
+### Three failures, priced differently
+
+A single recall number hides the distinction that matters most:
+
+| | what happened | what it costs |
+| --- | --- | --- |
+| `miss` | nothing came back | you lose the memory. Recoverable — `eve gaps` logs the whiff |
+| `misrank` | right memory returned, ranked under a wrong one | mild; the recall hook injects the whole block |
+| **`MISFIRE`** | non-empty block, right memory nowhere in it | the dangerous one |
+
+A misfire hands the agent only wrong memories, carrying precisely the authority a right one would have carried, with nothing in the block to contradict them. Injecting an irrelevant memory with authority is this project's own stated anti-goal ([chapter 05](05-design-laws.md)), so it gets its own column, its own detail section, and its own gate.
+
+The suite prints every misfire with the scores that produced it, because "recall fell" is a fact you can act on and "the ranker is bad" is not:
+
+```
+  [B06 paraphrase] 'any reason not to push to the test environment right before dinner'
+      returned    26  feature-flags-default-off-in-tests
+      returned     9  secrets-live-in-the-vault-not-the-image
+      returned     9  show-the-failure-before-proposing-a-fix
+      wanted       3  deploys-blocked-after-1800-utc  (needed 6 to be shown)
+```
+
+Read that one closely. It is a question about deploying in the evening, and the deploy-window memory scored 3 while a memory about feature flags in tests scored 26 — because `test` and `environment` are in the flag memory's title and tags, and a title hit is worth 10. The right answer was on disk the whole time. This is the failure that damages trust fastest, because the output is confident, relevant-looking, and wrong.
+
+### How to read a regression
+
+`evals/recall/baseline.json` is a committed floor, regenerated only on purpose. The rules:
+
+- per tier, `recall@1` and `recall@3` may not fall
+- per tier and overall, `MISFIRE` may not rise
+- improvements pass and print a reminder to re-record the floor
+
+Exit **0** pass, **1** regression, **2** harness error.
+
+Gating precision alongside recall is the entire point, because the obvious way to raise recall makes the system worse. Lower `EVE_MIN_SCORE` from 7 to 2 and paraphrase recall@3 goes **80% → 90%**, while misfires across the suite go **2 → 12** and four of the six out-of-scope controls stop being silent. On a recall-only scorecard that is a clear win and it gets merged. Here:
+
+```
+REGRESSED against the baseline:
+  - paraphrase: misfires rose 2 -> 3 (a non-empty block with the right memory nowhere in it)
+  - disjoint: misfires rose 1 -> 5
+  - out-of-scope: misfires rose 0 -> 3
+  - overall: misfires rose 3 -> 11
+```
+
+Total misfires nearly quadrupled, and three of the six out-of-scope controls — questions nothing in the store answers — started confidently answering. The suite refuses to call that an improvement. `sh evals/recall/selftest.sh` performs exactly this degradation on a throwaway copy of `bin/eve` and asserts the failure fires, alongside four others: gate raised, title weight flattened, stopword list emptied, and a tampered fixture. It also asserts that the gate-down run's recall genuinely *rose*, so the demonstration cannot quietly stop demonstrating anything.
+
+If you deliberately change the trade-off, re-record the floor and say what you traded:
+
+```sh
+sh evals/recall/run.sh --update-baseline
+```
+
+### Tiers are measured, not asserted
+
+A query's tier is derived from bin/eve's own tokenisation — same stopword list, read out of `bin/eve` at run time rather than copied, same substring semantics — and `run.py` exits 2 if a committed tier disagrees with the measurement. Add one word to a fixture memory and a `disjoint` query can become a `paraphrase` one; without this check the disjoint score would improve and the improvement would be an artifact of the fixture.
+
+The substring detail is worth knowing before you add a query: the scorer matches substrings, not words, so `app` matches `capp`ed and `live` matches `secrets-live-in-the-vault`. A query can land in `verbatim` entirely by accident. `python3 evals/recall/classify.py --query "..." --target some-id` prints which tokens matched and where, so you can see whether a tier was earned or stumbled into.
+
+### What this suite does not measure
+
+- **Whether the memory is right.** Same limit as the first suite. A perfectly retrieved wrong fact scores 100% here.
+- **Whether the agent uses what it was handed.** Retrieval delivering the memory and the model acting on it are different things; this measures the first.
+- **Real store size.** Twelve memories, one directory. Recall at two thousand memories across a year of drift is a different and harder number, and the honest expectation is that it is worse.
+- **Query realism beyond what one person wrote down.** Forty-five queries drafted in advance are a sample of how people ask, not a census. The mitigation is the same as everywhere else in this chapter: treat it as a floor you may not fall through, not a target to optimise — and when you add queries, add `paraphrase` and `disjoint` ones, because those are the ones that stay hard.
+
+The mitigation that already exists in the product is worth naming here, because it covers the case a fixed suite cannot: the recall hook logs every empty retrieval to `state/whiffs.log`, and `eve gaps` surfaces them. That is the system collecting field evidence of this exact failure from real queries you actually typed. It catches misses; it cannot catch misfires, because a misfire is not empty. Run both.
+
+---
+
 ## Limits
 
 The honest section. A small fixture suite measures less than its scorecard implies, and the gap matters.
@@ -304,7 +430,7 @@ The honest section. A small fixture suite measures less than its scorecard impli
 
 **2 · It cannot catch a wrong fact that was written into the KB in the first place.** This is the important one, and it is the same failure as chapter 08's limit 1, seen from the measurement side. If your KB says the timeout is 8 seconds and the running system says 30, a perfect score here is a perfectly grounded, perfectly cited, perfectly wrong answer — and it will be *harder* to doubt for having a citation. Grounding is provenance, never truth. The only defence is outside this suite: the reality-reconcile loop in [`loops/`](../loops/), `verified_on` dates, and the `verify:` line that makes a memory re-checkable against the world.
 
-**3 · Twenty questions over fourteen documents is small.** A real KB is thousands of files where retrieval itself is the hard part; here, everything fits in a context window and retrieval is nearly free. Expect real-world abstention to be *worse* than your score, because real absence is confounded with retrieval failure — the fact is there, phrased differently, and the agent says "not recorded." Chapter 08 calls those `unretrievable` gaps and they are a retrieval bug, not an honesty bug, but this suite cannot tell them apart.
+**3 · Twenty questions over fourteen documents is small.** A real KB is thousands of files where retrieval itself is the hard part; here, everything fits in a context window and retrieval is nearly free. Expect real-world abstention to be *worse* than your score, because real absence is confounded with retrieval failure — the fact is there, phrased differently, and the agent says "not recorded." Chapter 08 calls those `unretrievable` gaps and they are a retrieval bug, not an honesty bug, but this suite cannot tell them apart. The [retrieval-recall suite](#second-suite-retrieval-recall) above is the one that can: it measures exactly that failure in isolation, and its paraphrase recall is 50%.
 
 **4 · A fixed question set can be overfit.** Not by a model in the training sense, but by you: tune prompts against these twenty questions long enough and you get a system that is good at these twenty questions. The mitigation is to treat the suite as a regression test — a floor you must not fall through — rather than a target to optimise. When you add questions, add `ABSENT` ones. They are the ones that stay hard.
 

@@ -46,7 +46,7 @@ EVE_MAX_LINES=400
 # Raise it if recall is noisy, lower it if the store is quiet. See what the
 # scores actually are before changing it:
 #   eve search --query "your prompt" --all
-EVE_MIN_SCORE=6
+EVE_MIN_SCORE=7
 
 # ------------------------------------------------------------- session start
 # Ceiling on the standing block printed when a session opens.

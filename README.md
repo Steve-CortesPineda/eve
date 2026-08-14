@@ -87,7 +87,7 @@ memory store at all.
 ## 60-second quickstart
 
 ```sh
-git clone <this-repo> eve && cd eve
+git clone https://github.com/Steve-CortesPineda/eve.git && cd eve
 
 # 1. Make a store. This path is where the Tier 1 hooks look by default,
 #    so nothing has to move later.
@@ -95,10 +95,14 @@ mkdir -p ~/.eve/memory
 cp memory/TEMPLATE.md ~/.eve/memory/
 
 # 2. Write your first memory: the correction you have typed more than twice.
+#    This writes the memory AND creates ~/.eve/INDEX.md with a line for it.
 scripts/new-memory.sh -s ~/.eve/memory -t feedback \
   "Show the failing assertion before proposing a fix"
 
 # 3. Fill in **Why:** and **How to apply:** in the file it just printed.
+
+# 4. Confirm the two paths the rule block below names now exist.
+ls ~/.eve/INDEX.md ~/.eve/memory/
 ```
 
 Then add this to `~/.claude/CLAUDE.md`:
@@ -121,10 +125,91 @@ in ~/.eve/INDEX.md.
 Done. Ask your agent something adjacent to that memory and see whether the
 answer reflects it.
 
+**On the two index files.** Your live index is `~/.eve/INDEX.md`, and there is
+only ever one of them: `new-memory.sh` creates it and appends a line per
+memory, and on Tier 1 `eve index` regenerates the same file from the store and
+becomes authoritative. Do not edit it by hand — change the memory and
+regenerate, because an index that disagrees with the store re-introduces a dead
+claim every time it is read. The `memory/MEMORY.md` in this repo is *not* your
+index; it is a hand-written sample showing the one-line convention, and it stays
+in the clone.
+
 Read [`memory/examples/`](memory/examples/) for four worked memories, one per
 family. **Do not copy them into your store** — they describe a fictional
 company, and a store that contains fiction is a store that will tell you
 fiction.
+
+## Install
+
+Three ways in. They install the same files and end at the same place.
+**[docs/11-install.md](docs/11-install.md) covers all three in full**, with
+uninstall paths and the gotchas.
+
+```sh
+# Clone — canonical. Read the shell before you run it.
+git clone https://github.com/Steve-CortesPineda/eve.git && cd eve
+./install.sh --dry-run     # the whole plan, writes nothing
+./install.sh
+
+# npx — fastest. Two commands, deliberately.
+npx eve-recall init            # installs to ~/.eve; touches nothing in ~/.claude
+npx eve-recall install-hooks   # the opt-in step that wires the hooks
+```
+
+```
+# Claude Code plugin — most native. Registers the hooks itself.
+/plugin marketplace add Steve-CortesPineda/eve
+/plugin install eve@eve-marketplace
+/eve-setup
+```
+
+| | Best when | The catch |
+|---|---|---|
+| **Clone** | You want to read it first. | You keep a clone and `git pull` to update. |
+| **npx** | You want it working in thirty seconds. | Needs node **to deliver the files only** — see below. |
+| **Plugin** | You are in Claude Code already. | GitHub shorthand clones over **SSH**; without a key it fails with an error that never says "SSH". Fix: `export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`, or pass the full `https://…` URL. |
+
+**`eve` is not put on your PATH.** The installer writes the CLI to
+`~/.eve/bin/eve` and does not touch your shell startup file — that file is
+yours, and an installer that edits it unasked is one you stop trusting. So
+either use the full path, which always works:
+
+```sh
+~/.eve/bin/eve search "your query"
+```
+
+…or put it on PATH once, and the bare `eve …` in the rest of these docs
+resolves:
+
+```sh
+echo 'export PATH="$HOME/.eve/bin:$PATH"' >> ~/.zshrc   # bash: ~/.bashrc
+exec $SHELL -l
+```
+
+`./install.sh` prints whichever of those two you still need, with the exact
+line and the exact file for your shell, and checks PATH before it does.
+
+**npm is a delivery channel, not a runtime.** The package ships the same shell
+scripts the clone does plus a small dispatch shim. After `init`, what runs on
+every prompt is `sh` and `awk` under `~/.eve`, called by Claude Code directly —
+the shim is not in that path. Uninstall node afterwards and Eve keeps working.
+
+**Nothing is installed behind your back.** There is no `postinstall` script:
+`npm install eve-recall` writes into `node_modules` and stops. `init` creates
+`~/.eve` and touches neither `settings.json` nor `CLAUDE.md`; wiring the hooks
+is a separate command you have to type. Verify rather than believe it:
+
+```sh
+npm view eve-recall scripts dependencies   # both empty
+npx eve-recall print-hooks                 # prints the JSON, writes nothing
+```
+
+Uninstalling never deletes a memory: `./uninstall.sh`, `npx eve-recall
+uninstall`, or `/plugin uninstall eve@eve-marketplace`. The store at `~/.eve`
+is yours to remove, and only by hand.
+
+Not supported on native Windows — it is POSIX shell. It runs unchanged under
+WSL; install from inside the WSL shell.
 
 ## The three tiers
 
@@ -149,7 +234,23 @@ problem.
 
 ## How to verify it works
 
-Run the probe and read the bytes:
+Which probe you have depends on which tier you are on, so both are here. Run
+the one that matches what you actually typed.
+
+**On Tier 0** (you did the quickstart and nothing else — there is no `~/.eve/bin`
+yet, so `eve-doctor` does not exist). Verify from the clone, against your store:
+
+```sh
+ls ~/.eve/INDEX.md ~/.eve/memory/          # the paths your CLAUDE.md names
+bin/eve search "failing assertion"          # the retrieval, run by hand
+```
+
+The first command proves the agent is being sent to files that exist. The second
+prints the line the agent would receive. If it prints nothing, the memory is not
+reachable by those words — that is the signal to widen the title, not a reason to
+conclude the idea does not work.
+
+**On Tier 1** (you ran `./install.sh`), run the full probe and read the bytes:
 
 ```sh
 ~/.eve/bin/eve-doctor

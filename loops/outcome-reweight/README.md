@@ -4,14 +4,13 @@
 
 **Conditional second consumer:** `state/weights.tsv`, written *only* when you pass `--write-weights`, and only worth writing if your `eve search` reads it. Check first. A weights file that nothing multiplies by is the write-only producer in its purest form — a number computed every night, stored forever, multiplied by nothing.
 
-**Producer: you**, recording how a decision turned out. Either in frontmatter:
+**Producer: `eve outcome`.**
 
-```yaml
-outcome: worked        # worked | failed | mixed
-outcome_date: 2026-05-02
+```sh
+eve outcome drop-offset-pagination worked "duplicate-row reports went to zero"
 ```
 
-or, better, in the body, which holds more than one verdict:
+That appends one line to the memory's `## Outcomes` section and touches nothing else in the file:
 
 ```markdown
 ## Outcomes
@@ -20,7 +19,34 @@ or, better, in the body, which holds more than one verdict:
 - 2026-06-18 mixed - one caller stored page numbers in a saved-search table.
 ```
 
-Install this loop last. It has nothing to rank until decisions exist and outcomes have been recorded against them, and it is the only loop that requires a habit rather than a script.
+The argument before the verdict is an exact memory id, or any text that appears in exactly one id or title — `eve outcome pagination worked` if only one memory says "pagination". If more than one does, the command lists them and refuses; guessing which decision you meant is not a thing a tool should do with your notes.
+
+**Outcomes accumulate.** Running it again in November adds a second line. Nothing is overwritten, because a decision that worked in May and failed in November is two facts and not a correction — and this loop pays `+0.10` specifically for outcomes on two or more distinct dates. Re-running the same date and verdict writes nothing and says so, so a script that calls it twice cannot inflate the tally.
+
+**Frontmatter still counts, and is never written.**
+
+```yaml
+outcome: worked        # worked | failed | mixed
+outcome_date: 2026-05-02
+```
+
+Stores written before the command existed keep ranking exactly as they did; a `(date, verdict)` pair present in both places is counted once. But `eve outcome` will not put a verdict there and will not rewrite one that is there. That field holds a single value, so recording a second check would mean deleting the first — history destroyed one improvement at a time.
+
+**The other half of the habit is `eve waiting`**, which prints this loop's "waiting on reality" list without running the loop at all:
+
+```
+$ eve waiting
+1 of 3 decision(s) have never been checked against reality.
+
+    days  id                                   title
+      51  decision-move-reconcile-to-queue     Decided to move nightly reconciliation onto the job queue
+
+Record one:  eve outcome decision-move-reconcile-to-queue worked "what you observed"
+```
+
+It is also printed by `eve doctor`, and `eve add -t decision` scaffolds the empty `## Outcomes` section and tells you the command that fills it. Between them the habit has three prompts and no YAML.
+
+Install this loop last. It has nothing to rank until decisions exist and outcomes have been recorded against them. It is still the only loop that depends on you going and finding something out — the command removes the friction, not the looking.
 
 ## It ranks. That is all it does.
 
@@ -68,7 +94,7 @@ $EVE_HOME/loops/outcome-reweight/eve-outcome-rank.sh --write-weights
 
 ## Verified output
 
-Against the fixture store. `--stale-days 30` so the waiting list is populated (the fixture's untested decision is 50 days old):
+Against the fixture store. `--stale-days 30` so the waiting list is populated (the fixture's untested decision was created on 2026-06-24, so it clears that threshold on any plausible run date):
 
 ```
 $ EVE_HOME=loops/example-store sh loops/outcome-reweight/eve-outcome-rank.sh --dry-run --stale-days 30
@@ -97,16 +123,23 @@ you to do the thing that did not work last time.
 ## Waiting on reality (1)
 
 Asserted, never checked. This is the actionable list: pick one, find out
-what happened, and add a line under `## Outcomes`.
+what happened, and record it.
 
 | id | age (days) | title |
 |---|---|---|
-| decision-move-reconcile-to-queue | 50 | Decided to move nightly reconciliation onto the job queue |
+| decision-move-reconcile-to-queue | 51 | Decided to move nightly reconciliation onto the job queue |
+
+```sh
+eve outcome decision-move-reconcile-to-queue worked|failed|mixed "what you observed"
+```
+
+The same list, without running this loop: `eve waiting`.
 
 ## What this loop will not do
 
-- It will not edit a memory. Recording an outcome is a human act;
-  something that guessed outcomes would be inventing evidence.
+- It will not edit a memory. `eve outcome` writes the verdict you
+  hand it and nothing anywhere derives one, because an outcome a
+  program inferred is evidence a program invented.
 - It will not propose deleting anything, including a decision whose
   every outcome is `failed`. That file is the reason nobody repeats it.
 - It will not weight below 0.80. A multiplier that can reach zero is a
@@ -116,9 +149,13 @@ what happened, and add a line under `## Outcomes`.
 [dry run] nothing written.
 ```
 
-The top two rows are the design in one screenshot: the decision that failed twice and the decision that worked both sit at 1.35, above the one nobody ever checked. And the actionable output is not the ranking — it is the one-row table underneath it, naming a decision made 50 days ago that nobody has established the result of.
+The top two rows are the design in one screenshot: the decision that failed twice and the decision that worked both sit at 1.35, above the one nobody ever checked. And the actionable output is not the ranking — it is the one-row table underneath it, naming a decision nobody has established the result of, and the exact command that would settle it.
+
+(The age is measured from the report's own run date, so that number climbs by one each day the decision goes unchecked. Everything else in the output is fixed.)
 
 Verified separately: `--dry-run` writes nothing; a full run leaves every file in `memory/` byte-identical (`diff -r` clean); an invalid `--format` exits 64.
+
+Verified on the producer side too, because a command that writes into your notes has to earn it: creating a decision, recording an outcome, then recording a second one months later leaves the file byte-identical except for the added lines (`diff` shows insertions and zero modifications); the loop then reports both dates and pays the two-date bonus; re-running the same date and verdict writes nothing; an ambiguous name lists the candidates and exits 65 rather than picking one. `eve outcome` re-derives the original file from what it is about to write and refuses to write at all if they do not match.
 
 ## If you wire the weights file into retrieval
 
@@ -134,3 +171,17 @@ If you do not wire it in, do not pass `--write-weights`. That is not a style pre
 The body-outcome parser was a `sed` script containing `\(worked\|failed\|mixed\)`. That alternation is a GNU extension. BSD `sed` does not implement it, does not complain, and simply matches nothing — so every outcome recorded in a body section counted as zero on macOS. The report was well-formatted, internally consistent, and wrong: a decision with two recorded failures displayed `0 failed`, and the summary line agreed with it. Alternation now lives in `awk`'s ERE, where every implementation agrees what it means.
 
 The general shape is worth keeping: **a parser that finds nothing looks exactly like a store that contains nothing.** Any loop that reads a format should be tested against a fixture where the answer is known and non-zero, which is what `loops/example-store` is for.
+
+## The same bug from the other direction
+
+Adding `eve outcome` meant there were suddenly two programs reading this format, and writing the second one surfaced a case the first had always got wrong. A memory that documents the outcome format contains a sample line:
+
+````markdown
+```markdown
+- 2020-01-01 worked - this is a sample, not a verdict
+```
+````
+
+That sample was counted as a real verdict. Same failure as the `sed` bug — a report that is well-formatted, internally consistent, and wrong — arrived at by finding something that is not there instead of missing something that is. Both readers now skip fenced code, in three lines that are identical on purpose and commented as such in all three places.
+
+The rule that falls out of having two readers: **the format is the contract, and the reader you did not run is the one that was right.** `eve outcome` and this loop agree on what a verdict is, where to look for one, and that a `(date, verdict)` pair written in both frontmatter and the body counts once — not because they share code (a Tier 2 loop must stay standalone, and Tier 0 may not depend on one) but because the fixture is checked against both.

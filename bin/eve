@@ -10,6 +10,8 @@
 #   eve search --query Q [--limit N] [--exclude a,b] [--format hook|plain|tsv]
 #   eve index                regenerate $EVE_HOME/INDEX.md from the files
 #   eve add <title...>       scaffold a new memory
+#   eve outcome ID VERDICT   record how a decision turned out (appends)
+#   eve waiting              decisions reality has not voted on yet
 #   eve list                 every memory, one line each
 #   eve gaps                 what was asked and never answered
 #   eve on | eve off         the kill switch
@@ -74,7 +76,11 @@ cfg_load() {
 	_d_snippet=150
 	_d_candcap=300
 	_d_maxlines=400
-	_d_minscore=6
+	# The noise floor. One generic word in a body scores under this; two
+	# distinct body terms, or one term in a title, clears it. Raising it trades
+	# recall for precision one query at a time -- `eve search --all` prints the
+	# score of everything so you can see what a change would cost you.
+	_d_minscore=7
 	_d_disable=0
 
 	_f_limit=''
@@ -208,15 +214,42 @@ today() { date -u +%Y-%m-%d 2>/dev/null || printf 'unknown'; }
 # this, "how do we" matches every file that contains the word "we" and the
 # prefilter stops filtering anything.
 
-STOPWORDS=" a об the and or but for nor so yet at by in of on to up as is are was were be been being do does did doing have has had having i we you he she it they them this that these those there here what which who whom how why when where can could should would will shall may might must not no if then than with without from into over under again further once all any both each few more most other some such only own same too very just now our your their my me us "
+#
+# The second line is the one that was missing and it cost precision, not
+# recall. A title hit is the strongest signal this scorer has, so a temporal
+# preposition left in the list -- "before", "after", "while", "about",
+# "during" -- can score a full title hit on a memory that has nothing to do
+# with the question. Measured: "before we start" returned two unrelated
+# memories, and "not to push right before dinner" returned a memory about
+# showing failure output first, purely because its title contains "before".
+# These words never carry the topic of a question. They are dropped.
+STOPWORDS=" a an the and or but for nor so yet at by in of on to up as is are was were be been being do does did doing have has had having i we you he she it they them this that these those there here what which who whom how why when where can could should would will shall may might must not no if then than with without from into over under again further once all any both each few more most other some such only own same too very just now our your their my me us about after before during while since until upon within between through against above below along around across toward towards whether either neither also still ever else thus hence however therefore instead although because though unless please okay actually really maybe perhaps probably basically simply quite rather let lets got getting gonna wanna ok yes "
 
-tokenise() { # QUERY -> one token per line
+tokenise() { # QUERY -> one token per line, lightly stemmed
 	printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' ' ' |
 		tr ' ' '\n' | awk -v sw="$STOPWORDS" '
       NF == 0 { next }
       length($0) < 3 { next }
       { if (index(sw, " " $0 " ") > 0) next }
-      !seen[$0]++ { print; n++ }
+      # Light stem. A prompt and a memory almost never agree on inflection:
+      # you ask about "credentials" and the memory says "credential", you ask
+      # about "restarting" and it says "restart". Matching is done at a word
+      # boundary (see the scorer), so truncating the QUERY token to a prefix
+      # makes the memory word match while a mid-word coincidence still cannot.
+      #
+      # Two rules, both conservative:
+      #   longer than 6  -> keep the first 6 characters
+      #   4 to 6 and plural -> drop the trailing "s", unless it is "ss"
+      # so credentials->creden, restarting->restar, rows->row, but process
+      # stays process. Stopwords are checked BEFORE stemming, against the word
+      # the user actually typed.
+      {
+        t = $0
+        if (length(t) > 6) t = substr(t, 1, 6)
+        else if (length(t) >= 4 && substr(t, length(t), 1) == "s" && \
+                 substr(t, length(t) - 1) != "ss") t = substr(t, 1, length(t) - 1)
+      }
+      !seen[t]++ { print t; n++ }
       n >= 12 { exit }
     '
 }
@@ -289,6 +322,7 @@ EOF
 	#
 	# Sorted first, so that a given store and query always produce the same
 	# candidate set regardless of what order the filesystem hands back.
+	#
 	find "$MEMDIR" -maxdepth 1 -type f -name '*.md' -print0 2>/dev/null |
 		xargs -0 grep -ril -E -e "$PAT" 2>/dev/null |
 		sort >"$TMPD/cand.all" || :
@@ -345,31 +379,57 @@ EOF
 	# Scoring, in one pass. Weights are small integers on purpose: you should be
 	# able to read a score off the --all output and say why it is what it is.
 	#
-	#   title token          8   the title states the claim; a title hit is the
-	#                            strongest signal a flat store has
-	#   id (filename) token  6   you named the file after the claim
-	#   tag token            5
-	#   body token           2   capped, so one long file cannot out-shout a
-	#                            short exact match by sheer repetition
-	#   coverage             3 x (fraction of query tokens matched)
-	#   type: feedback      +2   standing rules should surface a little sooner
+	# A memory scores once per DISTINCT QUERY TERM it matches, at the weight of
+	# the best field that term hit -- not once per field and not once per
+	# occurrence:
+	#
+	#   title term           6   the title states the claim
+	#   id (filename) term   5   you named the file after the claim
+	#   tag term             4
+	#   body term            4   the "Why:" and "How to apply:" sections
+	#   same term, 2+ fields +1
+	#   x (1 + 0.5 x fraction of query terms matched)
+	#   type: feedback      x1.2   standing rules should surface a little sooner
 	#   status: superseded  x0.35  demoted, never removed -- law 4. A reversed
 	#                            claim you can still find is the point of a
 	#                            tombstone; it just must not outrank live ones.
+	#
+	# Taking the best field rather than the sum is what stops one word from
+	# deciding a search. Three different body terms now score 12 and beat a
+	# single title word at 6, which is the right way round: the body is where
+	# the reasoning lives, and a memory whose "Why:" answers three parts of the
+	# question is a better answer than one whose title happens to share a word.
 	xargs_awk "$TMPD/cand2" "$TOKS" >"$TMPD/scored" || :
 	[ -s "$TMPD/scored" ] || return 0
 
+	# Two gates, and --all turns off both, because the whole point of --all is
+	# to answer "why did that not come back" and a filter you cannot see makes
+	# that question unanswerable.
+	#
+	# The absolute gate is the noise floor: below it a match is one generic
+	# word and injecting it is worse than injecting nothing.
+	#
+	# The relative gate is about the SECOND and third hit. Once one memory is
+	# clearly the best answer, the runners-up are usually there on one shared
+	# word, and each one spends context to make the real answer harder to see.
+	# Dropping anything under 60% of the leader measured 14 stray memories down
+	# to 2 across a fixed 25-query set, with no hit lost. It cannot let junk in
+	# on its own: a candidate still has to clear the absolute gate first.
 	if [ "$SHOW_ALL" -eq 1 ]; then
 		GATE=0
+		RELGATE=0
 	else
 		GATE=$EVE_MIN_SCORE
+		RELGATE=0.60
 	fi
 
 	# Sort by score descending, then id ascending. The tiebreak is what makes
 	# two runs over an unchanged store produce identical bytes.
 	sort -t"$US" -k1,1nr -k2,2 "$TMPD/scored" |
-		awk -F"$US" -v gate="$GATE" -v lim="$LIMIT" '
+		awk -F"$US" -v gate="$GATE" -v lim="$LIMIT" -v rel="$RELGATE" '
+      NR == 1 { top = $1 + 0 }
       $1 + 0 < gate + 0 { next }
+      $1 + 0 < top * rel { next }
       { print; n++ }
       n >= lim { exit }
     ' >"$TMPD/hits" || :
@@ -435,7 +495,7 @@ xargs_awk() { # CANDFILE TOKENS
     # Scoring cannot happen here, because how much a token is worth depends on
     # how many OTHER candidates also contain it, and that is not known until
     # every file has been read. See the note above the END block.
-    function flush(   i, t, ht, hi, hg, any) {
+    function flush(   i, t, ht, hi, hg, any, bt) {
       if (cur == "") return
       if (title == "") { title = id; gsub(/-/, " ", title) }
 
@@ -448,13 +508,22 @@ xargs_awk() { # CANDFILE TOKENS
       ht = norm(title); hi = norm(id); hg = norm(tags)
       f_hay[nf] = ht
 
+      # Match at a word BOUNDARY, not anywhere in the string. Every haystack is
+      # space-separated and space-padded by norm(), so prefixing the token with
+      # a space anchors it to the start of a word: " live" still matches
+      # "lives" and "live", and no longer matches "delivery". Unanchored
+      # index() was quietly matching mid-word and it is the reason a lowered
+      # gate used to surface memories that share no word with the question.
+      # The match stays a PREFIX on the right so the light stem in tokenise()
+      # can reach an inflection the memory happens to use.
       for (i = 1; i <= ntok; i++) {
         t = tok[i]
         any = 0
-        if (index(ht, t) > 0) { hit_title[nf, t] = 1; any = 1 }
-        if (index(hi, t) > 0) { hit_id[nf, t]    = 1; any = 1 }
-        if (index(hg, t) > 0) { hit_tag[nf, t]   = 1; any = 1 }
-        if (bodyhits[t] > 0)  { hit_body[nf, t]  = 1; any = 1 }
+        bt = " " t
+        if (index(ht, bt) > 0) { hit_title[nf, t] = 1; any = 1 }
+        if (index(hi, bt) > 0) { hit_id[nf, t]    = 1; any = 1 }
+        if (index(hg, bt) > 0) { hit_tag[nf, t]   = 1; any = 1 }
+        if (bodyhits[t] > 0)   { hit_body[nf, t]  = 1; any = 1 }
         # Document frequency, for the weighting in END.
         if (any) df[t]++
       }
@@ -502,7 +571,7 @@ xargs_awk() { # CANDFILE TOKENS
         gsub(/^[*_ \t]+|[*_ \t]+$/, "", snippet)
       }
       hay = norm(line)
-      for (i = 1; i <= ntok; i++) if (index(hay, tok[i]) > 0) bodyhits[tok[i]]++
+      for (i = 1; i <= ntok; i++) if (index(hay, " " tok[i]) > 0) bodyhits[tok[i]]++
     }
 
     # Scoring, once every candidate has been read.
@@ -515,37 +584,59 @@ xargs_awk() { # CANDFILE TOKENS
     # hypothetical: it is what this scorer did before the down-weighting below,
     # and the wrong answers looked plausible enough to miss.
     #
-    # So a token that appears in more than half the candidates is treated as
-    # nearly uninformative and its weight drops to a quarter. It is a crude
-    # stand-in for inverse document frequency, computed over the candidate set
-    # rather than the whole store, and it costs one extra array.
+    # So a term is weighted down by how many memories contain it: a term unique
+    # to one memory is worth full price, one in three memories about half, one
+    # in ten about a third. Nothing is ever worth zero.
     #
-    # Field weights: the title states the claim, so a title hit is the strongest
-    # signal a flat store has. The body is capped per token rather than counted
-    # per occurrence -- occurrence counting is exactly what lets one long
-    # repetitive file out-shout a short exact match.
+    # The weight is a function of the document frequency ALONE, and that is the
+    # whole design. The textbook form divides by the size of the collection,
+    # which means either walking the store a second time -- measured at +11 ms
+    # on 2000 memories, more than this entire change costs -- or dividing by the
+    # number of CANDIDATES, which is a bug that hides in plain sight: a query
+    # matching exactly one memory has df == candidates, so its one true answer
+    # is judged "a term everything contains" and crushed. Measured under that
+    # divisor: "will restarting the box interrupt whoever is testing" scored its
+    # correct answer at 1. Dropping the collection size entirely measured better
+    # than either on the suite in evals/recall: same recall@1, one fewer
+    # misfire, and all seven disjoint controls silent instead of six.
+    #
+    # Field weights are taken as a MAX over the fields a term hit, not a sum.
+    # Summing means a single word appearing in the title and the filename and
+    # the body scores 18 and settles the search by itself, which is how a
+    # memory titled "...before proposing a fix" won a question about deploying
+    # before dinner. Taking the best field means the score counts HOW MANY
+    # DIFFERENT PARTS OF THE QUESTION a memory answers.
+    #
+    # Coverage multiplies rather than adds, for the same reason. Added, it is
+    # free score: a one-word query matches one word, coverage is 1.0, and a
+    # memory with a single generic body word collects the full bonus. That is
+    # exactly what made "before we start" return two unrelated memories.
     END {
       flush()
       if (nf == 0) exit 0
       for (i = 1; i <= ntok; i++) {
         t = tok[i]
-        w[t] = (df[t] > 0 && df[t] * 2 > nf) ? 0.25 : 1.0
+        w[t] = (df[t] > 1) ? 1 / (1 + log(df[t])) : 1.0
       }
       for (n = 1; n <= nf; n++) {
         sc = 0; hits = 0
         for (i = 1; i <= ntok; i++) {
           t = tok[i]
-          base = 0
-          if (hit_title[n, t]) base += 10
-          if (hit_id[n, t])    base += 6
-          if (hit_tag[n, t])   base += 5
-          if (hit_body[n, t])  base += 2
-          if (base > 0) hits++
-          sc += base * w[t]
+          best = 0; nfld = 0
+          if (hit_title[n, t]) { if (6 > best) best = 6; nfld++ }
+          if (hit_id[n, t])    { if (5 > best) best = 5; nfld++ }
+          if (hit_tag[n, t])   { if (4 > best) best = 4; nfld++ }
+          if (hit_body[n, t])  { if (4 > best) best = 4; nfld++ }
+          if (best == 0) continue
+          hits++
+          # The same term in the title AND the body is worth slightly more than
+          # in either alone: the memory both claims it and explains it.
+          if (nfld > 1) best += 1
+          sc += best * w[t]
         }
         if (hits == 0) continue
-        sc += (hits / ntok) * 3
-        if (f_type[n] == "feedback") sc += 2
+        sc = sc * (1 + 0.5 * (hits / ntok))
+        if (f_type[n] == "feedback") sc = sc * 1.2
         # Demote, never drop. A tombstone you cannot find is a deletion with
         # extra steps -- docs/05-design-laws.md, law 4.
         if (f_status[n] == "superseded") sc = sc * 0.35
@@ -735,6 +826,672 @@ cmd_add() {
 }
 
 # --------------------------------------------------------------------------
+# outcome, waiting
+# --------------------------------------------------------------------------
+#
+# A decision memory records what you chose. What it is missing, until someone
+# goes and looks, is what happened next. Recording that has always been the one
+# thing in Eve that needed a habit rather than a script, and it was also the
+# one thing that required hand-editing YAML -- which is a reliable way to make
+# sure a habit never forms. `eve outcome` is the whole ceremony:
+#
+#   eve outcome cache-manifests failed "the working set was not small"
+#
+# THE FORMAT IS THE CONTRACT. This command writes it and
+# loops/outcome-reweight/eve-outcome-rank.sh reads it. They are separate
+# programs on purpose -- a Tier 2 loop may not be installed, and nothing in
+# Tier 0 is allowed to depend on one -- so the shape below is the only thing
+# holding the two readers together:
+#
+#   ## Outcomes
+#   - YYYY-MM-DD worked|failed|mixed - free text
+#
+# and, single-valued and read-only to us, the older frontmatter spelling:
+#
+#   outcome: worked
+#   outcome_date: YYYY-MM-DD
+#
+# Both readers implement the same rules: the bullet may be `-`, `*` or `+`,
+# may be indented, the date must be the first whitespace-separated token and
+# the verdict the second, and the verdict is compared lowercased. A (date,
+# verdict) pair seen in both places counts once. loops/example-store is the
+# fixture where the answer is known and non-zero, which is how two readers of
+# one format are kept honest -- a parser that finds nothing looks exactly like
+# a store that contains nothing.
+#
+# WHY THIS NEVER WRITES FRONTMATTER. `outcome:` holds one verdict. A decision
+# gets checked more than once -- that is the entire point, and the loop pays
+# +0.10 for outcomes on two or more distinct dates -- so a command that wrote
+# frontmatter would have to overwrite the earlier verdict on the second run.
+# Erasing the first answer to store the second is not recording history, it is
+# destroying it one improvement at a time. The body section holds every
+# verdict; frontmatter is read for compatibility and never touched.
+
+# Three words, because the point of the field is to be countable. "Partially,
+# but only on the read path" is what the note is for.
+is_verdict() {
+	case "$1" in
+	worked | failed | mixed) return 0 ;;
+	esac
+	return 1
+}
+
+is_isodate() {
+	case "$1" in
+	[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]) return 0 ;;
+	esac
+	return 1
+}
+
+# One row per memory:  id US type US title US created US npairs US ndates US last
+#
+# `npairs` is the number of distinct (date, verdict) pairs, not the number of
+# lines, so the same verdict written in both frontmatter and the body counts
+# once -- which is what the loop counts, because it pipes through `sort -u`.
+# Getting this wrong would mean `eve waiting` and the loop disagree about
+# whether a decision has been checked, and the one you did not run would be
+# the one that was right.
+mem_rows() {
+	[ -d "$MEMDIR" ] || return 0
+	find "$MEMDIR" -maxdepth 1 -type f -name '*.md' -print0 2>/dev/null |
+		xargs -0 awk -v US="$US" '
+      function clean(v) { sub(/^[^:]*:[ \t]*/, "", v); gsub(/^[ \t"\047]+|[ \t"\047]+$/, "", v); return v }
+      function flush(   k, p, nd, np, last, d) {
+        if (cur == "") return
+        if (!skipf) {
+          if (title == "") { title = id; gsub(/-/, " ", title) }
+          if (fmo == "worked" || fmo == "failed" || fmo == "mixed")
+            pair[(fmd != "" ? fmd : "0000-00-00") " " fmo] = 1
+          np = 0; nd = 0; last = "-"
+          for (k in pair) {
+            np++
+            split(k, p, " ")
+            d = p[1]
+            if (d == "0000-00-00") continue
+            if (!(d in seend)) { seend[d] = 1; nd++ }
+            if (d > last) last = d
+          }
+          printf "%s%s%s%s%s%s%s%s%d%s%d%s%s\n", id, US, type, US, title, US, created, US, np, US, nd, US, last
+        }
+        title = ""; type = "note"; created = ""; fmo = ""; fmd = ""
+        infm = 0; fmdone = 0; fence = 0; incom = 0
+        for (k in pair) delete pair[k]
+        for (k in seend) delete seend[k]
+      }
+
+      BEGIN { type = "note" }
+
+      FILENAME != cur {
+        flush()
+        cur = FILENAME
+        base = cur; sub(/.*\//, "", base)
+        id = base; sub(/\.md$/, "", id)
+        skipf = (base == "TEMPLATE.md" || base == "MEMORY.md" || base == "INDEX.md" || base == "README.md")
+      }
+
+      skipf { next }
+
+      FNR == 1 { if ($0 ~ /^---[ \t]*$/) { infm = 1; next } }
+
+      infm && !fmdone {
+        if ($0 ~ /^---[ \t]*$/) { fmdone = 1; next }
+        if      ($0 ~ /^title:/)        title = clean($0)
+        else if ($0 ~ /^type:/)         type = clean($0)
+        else if ($0 ~ /^created:/)      created = clean($0)
+        else if ($0 ~ /^outcome:/)      fmo = tolower(clean($0))
+        else if ($0 ~ /^outcome_date:/) fmd = clean($0)
+        next
+      }
+
+      # The body scan. Deliberately not restricted to the ## Outcomes section:
+      # the loop is not restricted either, and two readers of one format that
+      # disagree about where to look is the bug this comment exists to prevent.
+      #
+      # Fenced code and block comments are skipped. A memory about this very
+      # format is likely to contain a sample outcome line, and a sample is not
+      # a verdict. A comment that OPENS mid-line is left alone, so a trailing
+      # `<!-- checked by Rye -->` on a real bullet still counts.
+      #
+      # These five lines appear in outcome_pairs() below and in
+      # loops/outcome-reweight/eve-outcome-rank.sh. If you change one, change
+      # all three, and check the fixture: two readers of one format that
+      # disagree is the failure this whole area is built to avoid.
+      {
+        line = $0
+        if (incom) { if (line ~ /-->/) incom = 0; next }
+        if (line ~ /^[ \t]*<!--/) { if (line !~ /-->/) incom = 1; next }
+        if (line ~ /^[ \t]*(```|~~~)/) { fence = 1 - fence; next }
+        if (fence) next
+        sub(/^[ \t]+/, "", line)
+        if (line !~ /^[-*+][ \t]+/) next
+        sub(/^[-*+][ \t]+/, "", line)
+        n = split(line, p, /[ \t]+/)
+        if (n < 2) next
+        d = p[1]; v = tolower(p[2])
+        if (d !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) next
+        if (v != "worked" && v != "failed" && v != "mixed") next
+        pair[d " " v] = 1
+      }
+
+      END { flush() }
+    ' 2>/dev/null | sort
+}
+
+# Every (date, verdict) pair already recorded in ONE file, one per line.
+# Used for the idempotency check: running the same command twice must not
+# write the same fact twice.
+outcome_pairs() { # FILE
+	awk '
+    function clean(v) { sub(/^[^:]*:[ \t]*/, "", v); gsub(/^[ \t"\047]+|[ \t"\047]+$/, "", v); return v }
+    NR == 1 { if ($0 ~ /^---[ \t]*$/) { infm = 1; next } }
+    infm && !fmdone {
+      if ($0 ~ /^---[ \t]*$/) { fmdone = 1; next }
+      if      ($0 ~ /^outcome:/)      fmo = tolower(clean($0))
+      else if ($0 ~ /^outcome_date:/) fmd = clean($0)
+      next
+    }
+    {
+      line = $0
+      if (incom) { if (line ~ /-->/) incom = 0; next }
+      if (line ~ /^[ \t]*<!--/) { if (line !~ /-->/) incom = 1; next }
+      if (line ~ /^[ \t]*(```|~~~)/) { fence = 1 - fence; next }
+      if (fence) next
+      sub(/^[ \t]+/, "", line)
+      if (line !~ /^[-*+][ \t]+/) next
+      sub(/^[-*+][ \t]+/, "", line)
+      n = split(line, p, /[ \t]+/)
+      if (n < 2) next
+      d = p[1]; v = tolower(p[2])
+      if (d !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) next
+      if (v != "worked" && v != "failed" && v != "mixed") next
+      seen[d " " v] = 1
+    }
+    END {
+      if (fmo == "worked" || fmo == "failed" || fmo == "mixed")
+        seen[(fmd != "" ? fmd : "0000-00-00") " " fmo] = 1
+      for (k in seen) print k
+    }
+  ' "$1" 2>/dev/null | sort
+}
+
+# Where a new outcome line belongs. Prints: MODE US LINENO
+#
+#   list     after the last bullet block of an existing `## Outcomes` section
+#   section  the section exists but holds no list yet; after its last content
+#   eof      no section; after the last non-blank line of the file
+#
+# "After the last bullet block" and not "at the end of the section", because a
+# section can end in prose -- the fixture's cache decision has a paragraph
+# after its outcome list -- and appending a bullet under a paragraph does not
+# join the list, it starts a second one with a paragraph wedged in the middle.
+# Bullet blocks include their wrapped continuation lines.
+#
+# Fenced code and HTML comment blocks are quoted, not written: a `## Outcomes`
+# heading or a `- 2020-01-01 worked` bullet inside one is a sample, and the
+# real answer never belongs next to it. The first end-to-end run of this
+# command proved the point by appending a live verdict into the middle of the
+# hint comment that `eve add -t decision` had just written -- syntactically in
+# the right section, invisible in every markdown renderer.
+outcome_slot() { # FILE
+	awk -v US="$US" '
+    { L[FNR] = $0; n = FNR }
+    END {
+      # One pre-pass marks every quoted line, so the two scans below cannot
+      # disagree about which lines are part of the document.
+      fence = 0; com = 0
+      for (i = 1; i <= n; i++) {
+        s = L[i]
+        if (com) { skip[i] = 1; if (s ~ /-->/) com = 0; continue }
+        if (s ~ /^[ \t]*(```|~~~)/) { fence = 1 - fence; skip[i] = 1; continue }
+        if (fence) { skip[i] = 1; continue }
+        if (s ~ /^[ \t]*<!--/) { skip[i] = 1; if (s !~ /-->/) com = 1; continue }
+      }
+
+      # Where the frontmatter ends. `#` starts a comment in YAML, so a
+      # frontmatter line reading `# Outcomes` looks exactly like the heading
+      # we are hunting for -- and acting on it would splice a markdown bullet
+      # into the middle of the block every other reader parses as YAML.
+      fmend = 0
+      if (n > 0 && L[1] ~ /^---[ \t]*$/) {
+        for (i = 2; i <= n; i++) if (L[i] ~ /^---[ \t]*$/) { fmend = i; break }
+      }
+
+      secstart = 0; secend = 0
+      for (i = fmend + 1; i <= n; i++) {
+        if (skip[i]) continue
+        if (L[i] !~ /^[ \t]*#+[ \t]*[^ \t]/) continue
+        t = L[i]; sub(/^[ \t]*#+[ \t]*/, "", t); sub(/[ \t]*$/, "", t)
+        if (secstart == 0) { if (tolower(t) ~ /^outcomes?$/) secstart = i }
+        else if (secend == 0) { secend = i - 1 }
+      }
+      if (secstart > 0 && secend == 0) secend = n
+
+      if (secstart == 0) {
+        last = 0
+        for (i = 1; i <= n; i++) if (L[i] !~ /^[ \t]*$/) last = i
+        printf "eof%s%d\n", US, last
+        exit 0
+      }
+
+      # A quoted line still counts as content -- the new bullet goes after the
+      # hint comment, not above it -- but it can never be the bullet we append
+      # to, which is the whole bug this pass exists to prevent.
+      inbul = 0; bullast = 0; lastnb = 0
+      for (i = secstart + 1; i <= secend; i++) {
+        s = L[i]
+        if (skip[i]) { lastnb = i; inbul = 0; continue }
+        if (s ~ /^[ \t]*$/) { inbul = 0; continue }
+        lastnb = i
+        if (s ~ /^[ \t]*[-*+][ \t]+/) { inbul = 1; bullast = i; continue }
+        if (inbul && s ~ /^[ \t]+[^ \t]/) { bullast = i; continue }
+        inbul = 0
+      }
+      if (bullast > 0)     printf "list%s%d\n", US, bullast
+      else if (lastnb > 0) printf "section%s%d\n", US, lastnb
+      else                 printf "section%s%d\n", US, secstart
+    }
+  ' "$1" 2>/dev/null
+}
+
+# Does the file end without a newline? Preserved, because "byte-identical
+# except the line you asked for" has to mean exactly that. A command that
+# quietly normalises your files is a command you stop pointing at your notes.
+file_noeol() { # FILE -> 0 (has trailing newline, or is empty) / 1 (does not)
+	[ -s "$1" ] || return 0
+	if [ "$(tail -c 1 "$1" 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
+		return 1
+	fi
+	return 0
+}
+
+outcome_usage() {
+	cat <<'EOF'
+usage: eve outcome <id-or-text> <worked|failed|mixed> [note...]
+       eve outcome --list
+
+Record what actually happened after a decision. The first argument names the
+memory -- an exact id, or any text that appears in one id or title. The second
+is the verdict. Everything after it is the note, and the note is the part
+worth typing: the verdict is countable, the note is why you believe it.
+
+  eve outcome cache-manifests failed "two workers hit the memory limit"
+  eve outcome decision-drop-offset-pagination mixed "one caller migrated by hand"
+
+  --date YYYY-MM-DD  when it was observed (default: today, UTC)
+  --dry-run          print the line and where it lands; write nothing
+  --list             show decisions with no outcome yet (same as: eve waiting)
+
+Outcomes ACCUMULATE. A second run on a later date adds a second line; nothing
+is overwritten, because a decision that worked in May and failed in November
+is two facts, not a correction. Re-running the same date and verdict writes
+nothing and says so.
+
+Exit: 64 usage, 65 the text matched more than one memory, 66 it matched none,
+69 no store, 73 the write or its self-check failed.
+EOF
+}
+
+cmd_outcome() {
+	TARGET=''
+	VERDICT=''
+	NOTE=''
+	ODATE=''
+	DRY=0
+	npos=0
+	ENDOPT=0
+
+	while [ $# -gt 0 ]; do
+		isopt=0
+		if [ "$ENDOPT" -eq 0 ]; then
+			case "$1" in
+			-*) isopt=1 ;;
+			esac
+		fi
+		if [ "$isopt" -eq 1 ]; then
+			case "$1" in
+			--) ENDOPT=1; shift ;;
+			--date) [ $# -ge 2 ] || die "outcome: --date needs a value" 64; ODATE=$2; shift 2 ;;
+			--date=*) ODATE=${1#--date=}; shift ;;
+			--dry-run) DRY=1; shift ;;
+			--list | -l) shift; cmd_waiting "$@"; return $? ;;
+			-h | --help) outcome_usage; return 0 ;;
+			*) die "outcome: unknown option: $1" 64 ;;
+			esac
+			continue
+		fi
+		npos=$((npos + 1))
+		case $npos in
+		1) TARGET=$1 ;;
+		2) VERDICT=$1 ;;
+		*) NOTE="$NOTE${NOTE:+ }$1" ;;
+		esac
+		shift
+	done
+
+	if [ -z "$TARGET" ]; then
+		outcome_usage >&2
+		exit 64
+	fi
+	[ -d "$MEMDIR" ] || die "no memory store at $MEMDIR (run: eve init)" 69
+
+	if [ -z "$VERDICT" ]; then
+		printf 'eve: outcome: say how it went -- worked, failed or mixed.\n' >&2
+		printf '     eve outcome %s worked "what you observed"\n' "$TARGET" >&2
+		exit 64
+	fi
+	VERDICT=$(printf '%s' "$VERDICT" | tr 'A-Z' 'a-z')
+	is_verdict "$VERDICT" ||
+		die "outcome: verdict must be worked, failed or mixed (got: $VERDICT)" 64
+
+	[ -n "$ODATE" ] || ODATE=$(today)
+	is_isodate "$ODATE" || die "outcome: --date must be YYYY-MM-DD (got: $ODATE)" 64
+
+	# The note has to stay on one line: both readers key on the second token of
+	# a bullet, so a wrapped note is a continuation line, not a second outcome.
+	#
+	# Newlines and tabs become spaces rather than being deleted. Deleting them
+	# is the obvious one-character difference and it silently welds the last
+	# word of one line to the first word of the next -- "path C:\tempsecond
+	# line" -- which reads like a typo you made rather than like something the
+	# tool did to you.
+	NOTE=$(printf '%s' "$NOTE" | tr '\r\n\t' '   ' | tr -d '\001-\010\013\014\016-\037' |
+		sed 's/  */ /g; s/^ //; s/ $//')
+
+	need_tmp
+	mem_rows >"$TMPD/rows"
+
+	# ------------------------------------------------------------- resolve
+	#
+	# An exact id wins outright: it is not a guess, so it is not ambiguous
+	# even when it is also a substring of some other id.
+	FILE=''
+	MTYPE=''
+	MTITLE=''
+	MID=''
+	if [ -f "$MEMDIR/$TARGET.md" ] && ! is_not_memory "$TARGET.md"; then
+		MID=$TARGET
+		FILE="$MEMDIR/$TARGET.md"
+		while IFS="$US" read -r i ty ti cr np nd la; do
+			[ "$i" = "$MID" ] || continue
+			MTYPE=$ty
+			MTITLE=$ti
+			break
+		done <"$TMPD/rows"
+		# mem_rows skips the scaffolds and the indexes, and yields nothing at
+		# all for a zero-byte file. Either way the id resolved to something
+		# that is not a memory, and an outcome recorded against a file that
+		# states no decision is a fact with nothing to attach to.
+		if [ -z "$MTYPE" ]; then
+			if [ ! -s "$FILE" ]; then
+				die "outcome: $TARGET.md is empty -- write the decision before recording how it went" 66
+			fi
+			die "outcome: $TARGET.md is a template or an index, not a memory" 66
+		fi
+	else
+		EVE_Q=$TARGET awk -F"$US" '
+      BEGIN { q = tolower(ENVIRON["EVE_Q"]) }
+      index(tolower($1), q) > 0 || index(tolower($3), q) > 0 { print }
+    ' "$TMPD/rows" >"$TMPD/match" || :
+		nm=$(wc -l <"$TMPD/match" | tr -d ' ')
+		if [ "$nm" -eq 0 ]; then
+			printf 'eve: no memory matches "%s"\n' "$TARGET" >&2
+			bur=$(find "$MEMDIR" -mindepth 2 -type f -name '*.md' 2>/dev/null |
+				grep -i -- "$TARGET" 2>/dev/null | head -n 3 || :)
+			if [ -n "$bur" ]; then
+				printf '\nFound it in a subdirectory of the store:\n' >&2
+				printf '%s\n' "$bur" | sed 's/^/  /' >&2
+				printf 'Retrieval and the outcome loop both read the store flat, so a memory\n' >&2
+				printf 'in a bucket directory is invisible to them. Move it up one level.\n' >&2
+			else
+				printf '\nDecisions with no outcome yet:  eve waiting\n' >&2
+				printf 'Everything in the store:        eve list\n' >&2
+			fi
+			exit 66
+		fi
+		if [ "$nm" -gt 1 ]; then
+			printf 'eve: "%s" matches %s memories. Naming one is your call, not mine:\n\n' \
+				"$TARGET" "$nm" >&2
+			while IFS="$US" read -r i ty ti cr np nd la; do
+				printf '  %-36s %-9s %s\n' "$i" "$ty" "$ti" >&2
+			done <"$TMPD/match" >&2
+			printf '\nRe-run with the id, or with text that appears in only one of them.\n' >&2
+			exit 65
+		fi
+		IFS="$US" read -r MID MTYPE MTITLE _cr _np _nd _la <"$TMPD/match"
+		FILE="$MEMDIR/$MID.md"
+	fi
+	[ -f "$FILE" ] || die "outcome: $FILE disappeared between listing and writing" 73
+
+	# ---------------------------------------------------- already recorded?
+	if outcome_pairs "$FILE" | grep -Fxq "$ODATE $VERDICT"; then
+		printf 'already recorded: %s %s in %s\n' "$ODATE" "$VERDICT" "$MID"
+		printf 'Nothing written. Same date and verdict is the same fact.\n'
+		printf 'To revise the note, edit the line: %s\n' "$(tilde "$FILE")"
+		return 0
+	fi
+
+	# ------------------------------------------------------------- the line
+	if [ -n "$NOTE" ]; then
+		BULLET="- $ODATE $VERDICT - $NOTE"
+	else
+		BULLET="- $ODATE $VERDICT"
+	fi
+
+	SLOT=$(outcome_slot "$FILE")
+	MODE=${SLOT%%"$US"*}
+	INS=${SLOT##*"$US"}
+	case "$MODE" in
+	list | section | eof) ;;
+	*) die "outcome: could not find a place for the outcome in $FILE" 73 ;;
+	esac
+	INS=$(intval "$INS" 0)
+
+	# The block, one line per line. `section` gets a blank first because the
+	# line above it is prose or a comment, and markdown needs the separation to
+	# read the bullet as a list at all.
+	: >"$TMPD/block"
+	case "$MODE" in
+	list) printf '%s\n' "$BULLET" >>"$TMPD/block" ;;
+	section)
+		printf '\n' >>"$TMPD/block"
+		printf '%s\n' "$BULLET" >>"$TMPD/block"
+		;;
+	eof)
+		[ "$INS" -gt 0 ] && printf '\n' >>"$TMPD/block"
+		printf '## Outcomes\n' >>"$TMPD/block"
+		printf '\n' >>"$TMPD/block"
+		printf '%s\n' "$BULLET" >>"$TMPD/block"
+		;;
+	esac
+	NBLOCK=$(wc -l <"$TMPD/block" | tr -d ' ')
+
+	if [ "$DRY" -eq 1 ]; then
+		printf '%s  (%s)\n' "$MID" "$MTYPE"
+		printf '  file    %s\n' "$(tilde "$FILE")"
+		case "$MODE" in
+		list) printf '  where   after line %s, the last outcome already there\n' "$INS" ;;
+		section) printf '  where   after line %s, in the existing Outcomes section\n' "$INS" ;;
+		eof) printf '  where   a new "## Outcomes" section at the end (after line %s)\n' "$INS" ;;
+		esac
+		printf '  adding  %s line(s):\n' "$NBLOCK"
+		sed 's/^/  | /' "$TMPD/block"
+		printf '[dry run] nothing written.\n'
+		return 0
+	fi
+
+	# ------------------------------------------------------------- rewrite
+	NOEOL=0
+	file_noeol "$FILE" || NOEOL=1
+
+	awk -v ins="$INS" -v noeol="$NOEOL" -v bf="$TMPD/block" '
+    BEGIN { while ((getline bl < bf) > 0) B[++nb] = bl }
+    { A[FNR] = $0; n = FNR }
+    END {
+      m = 0
+      if (ins == 0) for (j = 1; j <= nb; j++) O[++m] = B[j]
+      for (i = 1; i <= n; i++) {
+        O[++m] = A[i]
+        if (i == ins) for (j = 1; j <= nb; j++) O[++m] = B[j]
+      }
+      for (i = 1; i <= m; i++) {
+        printf "%s", O[i]
+        if (i < m || noeol == 0) printf "\n"
+      }
+    }
+  ' "$FILE" >"$TMPD/new" || die "outcome: rewrite failed" 73
+	[ -s "$TMPD/new" ] || die "outcome: rewrite produced an empty file; $FILE untouched" 73
+
+	# The self-check, and the reason this command can be trusted with your
+	# notes: delete exactly the lines we claim to have inserted, and what is
+	# left must be the original file byte for byte. If it is not, something in
+	# the rewrite is wrong in a way no amount of reading the diff by eye would
+	# reliably catch, and the right move is to write nothing at all.
+	awk -v s="$INS" -v e="$((INS + NBLOCK))" -v noeol="$NOEOL" '
+    { if (FNR > s && FNR <= e) next; A[++m] = $0 }
+    END {
+      for (i = 1; i <= m; i++) {
+        printf "%s", A[i]
+        if (i < m || noeol == 0) printf "\n"
+      }
+    }
+  ' "$TMPD/new" >"$TMPD/recon" || die "outcome: self-check failed to run" 73
+	cmp -s "$TMPD/recon" "$FILE" ||
+		die "outcome: self-check failed -- the rewrite would have changed more than the outcome line. $FILE is untouched; please report this" 73
+
+	# `cat` and not `mv`: the memory keeps its inode, its mode and any symlink
+	# pointing at it. mv would hand it the 0600 of a file born in a temp dir.
+	cat "$TMPD/new" >"$FILE" || die "outcome: cannot write $FILE" 73
+
+	NDATES=$(outcome_pairs "$FILE" | awk '$1 != "0000-00-00" { print $1 }' | sort -u | wc -l | tr -d ' ')
+
+	printf 'recorded %s %s\n' "$ODATE" "$VERDICT"
+	printf '  in     %s\n' "$(tilde "$FILE")"
+	printf '  line   %s\n' "$BULLET"
+	if [ "$NDATES" -ge 2 ]; then
+		printf '  now    %s distinct outcome dates on this decision\n' "$NDATES"
+	fi
+	if [ -z "$NOTE" ]; then
+		printf '  note   no evidence recorded. The verdict is countable; the note is\n'
+		printf '         the part that stops the next reader taking it on faith.\n'
+	fi
+	if [ "$MTYPE" != "decision" ]; then
+		printf '  note   this memory is type "%s". The outcome loop ranks decisions\n' "$MTYPE"
+		printf '         unless you run it with --all, so this line may not appear.\n'
+	fi
+}
+
+waiting_usage() {
+	cat <<'EOF'
+usage: eve waiting [--days N] [--limit N] [--format plain|tsv]
+
+Decisions reality has not voted on: type `decision`, no outcome recorded
+anywhere in the file, oldest first. This is the list the habit runs on.
+
+  --days N     only those older than N days (default 0: all of them)
+  --limit N    at most N rows (default 0: no limit)
+  --format     plain | tsv
+
+Age is measured from `created`, not from the file's mtime: fixing a typo in a
+decision does not make it younger, and it certainly does not mean anyone found
+out whether the decision worked. A decision with no `created` shows `?`.
+EOF
+}
+
+cmd_waiting() {
+	WDAYS=0
+	WLIMIT=0
+	WFMT=plain
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--days) [ $# -ge 2 ] || die "waiting: --days needs a value" 64; WDAYS=$2; shift 2 ;;
+		--days=*) WDAYS=${1#--days=}; shift ;;
+		--limit) [ $# -ge 2 ] || die "waiting: --limit needs a value" 64; WLIMIT=$2; shift 2 ;;
+		--limit=*) WLIMIT=${1#--limit=}; shift ;;
+		--format) [ $# -ge 2 ] || die "waiting: --format needs a value" 64; WFMT=$2; shift 2 ;;
+		--format=*) WFMT=${1#--format=}; shift ;;
+		-h | --help) waiting_usage; return 0 ;;
+		*) die "waiting: unknown option: $1" 64 ;;
+		esac
+	done
+	case "$WFMT" in
+	plain | tsv) ;;
+	*) die "waiting: --format must be plain or tsv" 64 ;;
+	esac
+	WDAYS=$(intval "$WDAYS" 0)
+	WLIMIT=$(intval "$WLIMIT" 0)
+
+	[ -d "$MEMDIR" ] || die "no memory store at $MEMDIR (run: eve init)" 69
+	need_tmp
+	mem_rows >"$TMPD/rows"
+
+	NDEC=$(awk -F"$US" '$2 == "decision"' "$TMPD/rows" | wc -l | tr -d ' ')
+
+	# Ages are computed in awk from the civil date rather than by forking
+	# `date` per file. BSD date wants -j -f and GNU date wants -d, neither
+	# accepts the other's spelling, and an age that depends on which coreutils
+	# you have is not an age. This arithmetic is the same everywhere.
+	awk -F"$US" -v US="$US" -v today="$(today)" -v mind="$WDAYS" '
+    function dfc(y, m, d,   era, yoe, doy, doe) {
+      if (m <= 2) y -= 1
+      era = int(y / 400)
+      yoe = y - era * 400
+      doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+      doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+      return era * 146097 + doe - 719468
+    }
+    function days(s,   p) {
+      if (s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return -1
+      split(s, p, "-")
+      return dfc(p[1] + 0, p[2] + 0, p[3] + 0)
+    }
+    BEGIN { now = days(today) }
+    $2 == "decision" && $5 + 0 == 0 {
+      age = -1
+      if (now >= 0) { c = days($4); if (c >= 0 && now >= c) age = now - c }
+      if (age >= 0 && age < mind) next
+      printf "%d%s%s%s%s\n", age, US, $1, US, $3
+    }
+  ' "$TMPD/rows" | sort -t"$US" -k1,1nr -k2,2 >"$TMPD/wait" || :
+
+	NW=$(wc -l <"$TMPD/wait" | tr -d ' ')
+	if [ "$WLIMIT" -gt 0 ]; then
+		head -n "$WLIMIT" "$TMPD/wait" >"$TMPD/wait.cut" && mv "$TMPD/wait.cut" "$TMPD/wait"
+	fi
+
+	if [ "$WFMT" = tsv ]; then
+		tr "$US" '\t' <"$TMPD/wait"
+		return 0
+	fi
+
+	if [ "$NW" -eq 0 ]; then
+		if [ "$NDEC" -eq 0 ]; then
+			printf 'No decision memories in %s yet.\n' "$(tilde "$MEMDIR")"
+			printf 'A decision is a call you made and the reasoning that made it:\n'
+			printf '  eve add -t decision "Dropped offset pagination from the v3 API"\n'
+		elif [ "$WDAYS" -gt 0 ]; then
+			printf 'Every decision older than %s days has a recorded outcome.\n' "$WDAYS"
+		else
+			printf 'Every decision has at least one recorded outcome. Nothing is waiting.\n'
+		fi
+		return 0
+	fi
+
+	printf '%s of %s decision(s) have never been checked against reality' "$NW" "$NDEC"
+	[ "$WDAYS" -gt 0 ] && printf ', over %s days old' "$WDAYS"
+	printf '.\n\n'
+	printf '  %6s  %-36s %s\n' days id title
+	while IFS="$US" read -r ag idd ttl; do
+		[ -n "$idd" ] || continue
+		if [ "$ag" -lt 0 ]; then ag='?'; fi
+		printf '  %6s  %-36s %s\n' "$ag" "$idd" "$ttl"
+	done <"$TMPD/wait"
+	TOPID=$(sed -n '1p' "$TMPD/wait" | cut -d"$US" -f2)
+	printf '\nRecord one:  eve outcome %s worked "what you observed"\n' "$TOPID"
+	printf 'Verdicts:    worked | failed | mixed. Outcomes accumulate; nothing is\n'
+	printf '             overwritten, so a decision can be checked again next year.\n'
+}
+
+# --------------------------------------------------------------------------
 # kill switch
 # --------------------------------------------------------------------------
 #
@@ -787,7 +1544,7 @@ EVE_RECALL_MIN_PROMPT=12
 EVE_SNIPPET_CHARS=150
 EVE_CANDIDATE_CAP=300
 EVE_MAX_LINES=400
-EVE_MIN_SCORE=6
+EVE_MIN_SCORE=7
 EVE_BRIEF_MAX_CHARS=800
 EVE_ENGINE=awk
 EVE_DEBUG=0
@@ -823,11 +1580,18 @@ usage: eve <command> [options]
   index              regenerate INDEX.md from the files. Superseded memories
                      are left out; they stay on disk.
   add <title...>     scaffold a new memory from the template
+  outcome <id-or-text> <worked|failed|mixed> [note...]
+                     record what actually happened after a decision. Appends;
+                     a second verdict never overwrites the first.
+  waiting            decisions with no recorded outcome, oldest first
   list               every memory, one line each
   gaps               subjects asked about that the store could not answer
   on | off           kill switch; sets EVE_DISABLE in the config
   init               create the tree and a config. Never overwrites.
   doctor             run the health check and the live probe
+  bench              time the recall hook on THIS machine: p50/p95 against
+                     your store, the fixed startup floor measured separately,
+                     and a verdict against the per-prompt budget
   version            print the version
 
 Environment:
@@ -848,6 +1612,8 @@ index) cmd_index "$@" ;;
 list) cmd_list "$@" ;;
 gaps) cmd_gaps "$@" ;;
 add | new) cmd_add "$@" ;;
+outcome) cmd_outcome "$@" ;;
+waiting) cmd_waiting "$@" ;;
 init) cmd_init "$@" ;;
 off) set_disable 1 ;;
 on) set_disable 0 ;;
@@ -856,6 +1622,23 @@ doctor)
 		exec "$EVE_HOME/bin/eve-doctor" "$@"
 	fi
 	die "eve-doctor is not installed; re-run the repo installer" 69
+	;;
+bench)
+	# Same hand-off shape as `doctor`, with one addition: fall back to a
+	# sibling of this script, so `./bin/eve bench` works from a clone that has
+	# not been installed. Every tuning constant in here was picked on one fast
+	# machine; this is how a user finds out what they cost on theirs.
+	if [ -x "$EVE_HOME/bin/eve-bench" ]; then
+		exec "$EVE_HOME/bin/eve-bench" "$@"
+	fi
+	_self_dir=''
+	case "$0" in
+	*/*) _self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || _self_dir='' ;;
+	esac
+	if [ -n "$_self_dir" ] && [ -x "$_self_dir/eve-bench" ]; then
+		exec "$_self_dir/eve-bench" "$@"
+	fi
+	die "eve-bench is not installed; re-run the repo installer" 69
 	;;
 version | --version | -V) printf 'eve %s\n' "$EVE_VERSION" ;;
 help | --help | -h) usage ;;

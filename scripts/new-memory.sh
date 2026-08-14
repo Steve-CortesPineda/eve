@@ -270,6 +270,55 @@ if [ ! -s "$TMP" ]; then
 	die "template rendered empty: $TEMPLATE"
 fi
 
+# A decision is the one type that is not finished when you write it. It is a
+# claim about the future, and the only thing that settles it is going back
+# later to see. So a decision gets a place for that answer to land at the
+# moment it is created -- an empty section is a question the file is asking,
+# and a file that never asks is a file nobody ever answers.
+#
+# The fragment lives in templates/decision-outcomes.md when this script is run
+# from a clone. The installed copy at $EVE_HOME/bin/eve-new-memory has no
+# templates/ next to it, so the identical text is inlined below and used when
+# the file is absent. If you edit one, edit the other; the file wins when it
+# exists, and both are checked by verifying that a new decision contains an
+# "## Outcomes" heading.
+# `-E` and a bare `?`. In a basic regular expression the equivalent is `\?`,
+# which is a GNU extension: BSD grep happens to honour it, POSIX does not
+# require it, and this repo has already been bitten once by GNU-only
+# alternation in a BRE that BSD sed silently matched nothing with. Alternation
+# and optionality live in EREs here, where every implementation agrees.
+if [ "$TYPE" = decision ] && ! grep -qiE '^##[[:space:]]*outcomes?[[:space:]]*$' "$TMP"; then
+	FRAG=
+	for cand in "${EVE_HOME:-$HOME/.eve}/templates/decision-outcomes.md" \
+		"$REPO_DIR/templates/decision-outcomes.md"; do
+		if [ -f "$cand" ]; then
+			FRAG=$cand
+			break
+		fi
+	done
+	printf '\n' >>"$TMP"
+	if [ -n "$FRAG" ]; then
+		EVE_ID=$SLUG awk '
+		function repl(s, key, val,   out, p) {
+			out = ""
+			while ((p = index(s, key)) > 0) {
+				out = out substr(s, 1, p - 1) val
+				s = substr(s, p + length(key))
+			}
+			return out s
+		}
+		BEGIN { id = ENVIRON["EVE_ID"] }
+		{ print repl($0, "{{ID}}", id) }
+		' "$FRAG" >>"$TMP"
+	else
+		cat >>"$TMP" <<EOF
+## Outcomes
+
+<!-- eve outcome $SLUG worked|failed|mixed "what you observed" -- appends, never overwrites -->
+EOF
+	fi
+fi
+
 mv "$TMP" "$FILE"
 TMP=
 
@@ -285,11 +334,49 @@ if [ -z "$INDEX" ]; then
 		fi
 	done
 fi
+# No index exists yet, so this call decides where one lives -- and that choice
+# has to agree with the CLAUDE.md rule block, which tells the agent to read
+# $EVE_HOME/INDEX.md. In the standard layout (store at $EVE_HOME/memory) the
+# answer is therefore $EVE_HOME/INDEX.md, not $STORE/MEMORY.md: defaulting to
+# the latter created a second, competing index that nothing told the agent to
+# read, so a Tier 0 user finished the quickstart and was pointed at a file
+# that had never been written.
+#
+# Both files would be legal; having both is what is not. `eve index`
+# regenerates $EVE_HOME/INDEX.md from the store and knows nothing about
+# MEMORY.md, so a store carrying both ends up with one index that updates and
+# one that quietly rots -- and an index that lies is worse than no index.
+# The link this script writes is relative to the index's own directory, so in
+# this layout it comes out as `memory/<id>.md`, byte-identical to what
+# `eve index` emits. The generated rebuild can take the file over without a
+# diff.
+#
+# Any other store shape keeps the old behaviour: a standalone directory of
+# memories gets its index beside them.
 if [ -z "$INDEX" ]; then
-	INDEX=$STORE/MEMORY.md
+	EVE_HOME_D=${EVE_HOME:-$HOME/.eve}
+	case $EVE_HOME_D in
+	"~") EVE_HOME_D=$HOME ;;
+	"~/"*) EVE_HOME_D=$HOME/${EVE_HOME_D#"~/"} ;;
+	esac
+	# $STORE is already absolute and symlink-resolved (cd + pwd above), so
+	# normalise this side the same way or two spellings of one directory fail
+	# to compare equal -- on macOS /tmp vs /private/tmp does exactly that.
+	if [ -d "$EVE_HOME_D" ]; then
+		EVE_HOME_D=$(cd "$EVE_HOME_D" && pwd)
+	fi
+	if [ "$STORE" = "$EVE_HOME_D/memory" ]; then
+		INDEX=$EVE_HOME_D/INDEX.md
+	else
+		INDEX=$STORE/MEMORY.md
+	fi
 fi
 if [ ! -f "$INDEX" ]; then
-	printf '# Memory index\n\nOne line per memory: the claim, not the topic.\n' >"$INDEX"
+	printf '# Memory index\n\n' >"$INDEX"
+	printf 'One line per memory: the claim, not the topic.\n' >>"$INDEX"
+	printf '\n' >>"$INDEX"
+	printf '<!-- Maintained incrementally by new-memory.sh. `eve index` rebuilds this\n' >>"$INDEX"
+	printf '     file from the store and is authoritative once you are on Tier 1. -->\n' >>"$INDEX"
 fi
 
 INDEX_DIR=$(cd "$(dirname "$INDEX")" && pwd)
@@ -354,6 +441,11 @@ if [ "$TYPE_KNOWN" -eq 0 ]; then
 	printf 'note     type "%s" is not one of feedback/project/decision/reference/note\n' "$TYPE"
 fi
 printf 'next     fill in Why and How to apply; a memory without them gets misapplied\n'
+if [ "$TYPE" = decision ]; then
+	printf 'later    when you find out how it went, one command closes the loop:\n'
+	printf '           eve outcome %s worked|failed|mixed "what you observed"\n' "$SLUG"
+	printf '         until then it shows up in: eve waiting\n'
+fi
 
 if [ "$OPEN_EDITOR" -eq 1 ]; then
 	if [ -z "${EDITOR:-}" ]; then

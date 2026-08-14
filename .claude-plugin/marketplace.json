@@ -1,0 +1,22 @@
+{
+  "name": "eve-marketplace",
+  "owner": {
+    "name": "Steve-CortesPineda",
+    "url": "https://github.com/Steve-CortesPineda"
+  },
+  "description": "One plugin: Eve, cross-session memory for Claude Code.",
+  "plugins": [
+    {
+      "name": "eve",
+      "source": "./",
+      "description": "Cross-session memory for Claude Code. A curated store of markdown files under ~/.eve, recalled automatically on every prompt. POSIX sh and awk; no dependencies, no network, no telemetry.",
+      "category": "memory",
+      "tags": [
+        "memory",
+        "context",
+        "recall",
+        "grounding"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,298 @@
+{
+  "version": 1,
+  "about": [
+    "Pre-registered retrieval queries. The `tier` on each entry is not a label:",
+    "run.py re-derives it from the measured lexical overlap between the query's",
+    "surviving tokens and the target file, using bin/eve's own tokenisation, and",
+    "refuses to run if a committed tier disagrees. Edit a fixture memory and the",
+    "suite tells you which query changed tier instead of quietly reporting a",
+    "different number under the same name.",
+    "",
+    "tier verbatim     2+ surviving tokens land in the target's title, filename",
+    "                  or tags. The query you type when you remember the memory.",
+    "tier paraphrase   1+ token lands somewhere in the file, fewer than 2 in the",
+    "                  high-weight fields. Real mid-task questions live here.",
+    "tier disjoint     no surviving token appears anywhere in the target. The",
+    "                  ranker cannot retrieve it at any gate; this tier measures",
+    "                  the ceiling of lexical matching, not a tuning mistake.",
+    "tier out-of-scope no memory in the store answers this. Anything returned is",
+    "                  a false positive. Unlike the other three, this tier is a",
+    "                  human claim about the fixture, checked once by reading it."
+  ],
+  "queries": [
+    {
+      "id": "A01",
+      "tier": "verbatim",
+      "query": "are deploys blocked after 18:00 UTC",
+      "target": "deploys-blocked-after-1800-utc"
+    },
+    {
+      "id": "A02",
+      "tier": "verbatim",
+      "query": "do secrets get baked into the image",
+      "target": "secrets-live-in-the-vault-not-the-image"
+    },
+    {
+      "id": "A03",
+      "tier": "verbatim",
+      "query": "does Lantern paginate with keyset cursors",
+      "target": "lantern-paginates-with-keyset-cursors"
+    },
+    {
+      "id": "A04",
+      "tier": "verbatim",
+      "query": "which process writes Harborlight shipments",
+      "target": "harborlight-has-one-manifest-writer"
+    },
+    {
+      "id": "A05",
+      "tier": "verbatim",
+      "query": "how does the carrier tracking API signal throttling",
+      "target": "carrier-throttle-returns-empty-200"
+    },
+    {
+      "id": "A06",
+      "tier": "verbatim",
+      "query": "when do Quarry reporting tables rebuild",
+      "target": "quarry-rebuilds-nightly-at-0300"
+    },
+    {
+      "id": "A07",
+      "tier": "verbatim",
+      "query": "what is the database connection pool capped at",
+      "target": "connection-pool-capped-at-twenty"
+    },
+    {
+      "id": "A08",
+      "tier": "verbatim",
+      "query": "do feature flags default to off in tests",
+      "target": "feature-flags-default-off-in-tests"
+    },
+    {
+      "id": "A09",
+      "tier": "verbatim",
+      "query": "when can schema migrations run",
+      "target": "migrations-never-during-business-hours"
+    },
+    {
+      "id": "A10",
+      "tier": "verbatim",
+      "query": "why did we choose SQLite over Postgres for the CLI",
+      "target": "chose-sqlite-over-postgres-for-the-cli"
+    },
+    {
+      "id": "A11",
+      "tier": "verbatim",
+      "query": "who reviews my changes",
+      "target": "nobody-reviews-your-changes"
+    },
+    {
+      "id": "A12",
+      "tier": "verbatim",
+      "query": "show the real failure output first",
+      "target": "show-the-failure-before-proposing-a-fix"
+    },
+
+    {
+      "id": "B01",
+      "tier": "paraphrase",
+      "query": "is it fine to hardcode the key in the docker image",
+      "target": "secrets-live-in-the-vault-not-the-image"
+    },
+    {
+      "id": "B02",
+      "tier": "paraphrase",
+      "query": "can I put the token in the dockerfile just for staging",
+      "target": "secrets-live-in-the-vault-not-the-image"
+    },
+    {
+      "id": "B03",
+      "tier": "paraphrase",
+      "query": "users say the list repeats entries as they scroll down",
+      "target": "lantern-paginates-with-keyset-cursors"
+    },
+    {
+      "id": "B04",
+      "tier": "paraphrase",
+      "query": "can I jump straight to page 5 of the results",
+      "target": "lantern-paginates-with-keyset-cursors"
+    },
+    {
+      "id": "B05",
+      "tier": "paraphrase",
+      "query": "is it too late in the day to release",
+      "target": "deploys-blocked-after-1800-utc"
+    },
+    {
+      "id": "B06",
+      "tier": "paraphrase",
+      "query": "any reason not to push to the test environment right before dinner",
+      "target": "deploys-blocked-after-1800-utc",
+      "note": "The confident-wrong case. 'before' is not a stopword and a title hit is worth 10."
+    },
+    {
+      "id": "B07",
+      "tier": "paraphrase",
+      "query": "the report numbers do not match the live data this afternoon",
+      "target": "quarry-rebuilds-nightly-at-0300"
+    },
+    {
+      "id": "B08",
+      "tier": "paraphrase",
+      "query": "why is yesterday revenue missing from the dashboard",
+      "target": "quarry-rebuilds-nightly-at-0300"
+    },
+    {
+      "id": "B09",
+      "tier": "paraphrase",
+      "query": "we are running out of database handles when we scale out",
+      "target": "connection-pool-capped-at-twenty"
+    },
+    {
+      "id": "B10",
+      "tier": "paraphrase",
+      "query": "the service stalls under heavy traffic should I raise the limit",
+      "target": "connection-pool-capped-at-twenty"
+    },
+    {
+      "id": "B11",
+      "tier": "paraphrase",
+      "query": "the suite passes locally and fails in CI depending on who toggled what",
+      "target": "feature-flags-default-off-in-tests"
+    },
+    {
+      "id": "B12",
+      "tier": "paraphrase",
+      "query": "should I add another consumer that inserts into shipments",
+      "target": "harborlight-has-one-manifest-writer"
+    },
+    {
+      "id": "B13",
+      "tier": "paraphrase",
+      "query": "duplicate rows appear after a retry in the ingest pipeline",
+      "target": "harborlight-has-one-manifest-writer"
+    },
+    {
+      "id": "B14",
+      "tier": "paraphrase",
+      "query": "the tracking sync returned nothing at all is that normal",
+      "target": "carrier-throttle-returns-empty-200"
+    },
+    {
+      "id": "B15",
+      "tier": "paraphrase",
+      "query": "should I add an index to the big table on monday morning",
+      "target": "migrations-never-during-business-hours"
+    },
+    {
+      "id": "B16",
+      "tier": "paraphrase",
+      "query": "is it safe to alter the table while people are working",
+      "target": "migrations-never-during-business-hours"
+    },
+    {
+      "id": "B17",
+      "tier": "paraphrase",
+      "query": "why not just use a real database for the local tool",
+      "target": "chose-sqlite-over-postgres-for-the-cli"
+    },
+    {
+      "id": "B18",
+      "tier": "paraphrase",
+      "query": "I merged something large and it broke in production",
+      "target": "nobody-reviews-your-changes"
+    },
+    {
+      "id": "B19",
+      "tier": "paraphrase",
+      "query": "you proposed a fix without running anything",
+      "target": "show-the-failure-before-proposing-a-fix"
+    },
+    {
+      "id": "B20",
+      "tier": "paraphrase",
+      "query": "stop guessing from the test name",
+      "target": "show-the-failure-before-proposing-a-fix"
+    },
+
+    {
+      "id": "C01",
+      "tier": "disjoint",
+      "query": "can we ship this evening",
+      "target": "deploys-blocked-after-1800-utc"
+    },
+    {
+      "id": "C02",
+      "tier": "disjoint",
+      "query": "clients report seeing the same record twice when scrolling",
+      "target": "lantern-paginates-with-keyset-cursors"
+    },
+    {
+      "id": "C03",
+      "tier": "disjoint",
+      "query": "why do items appear more than once as I scroll",
+      "target": "lantern-paginates-with-keyset-cursors"
+    },
+    {
+      "id": "C04",
+      "tier": "disjoint",
+      "query": "the chart looks wrong compared to what I see in the product",
+      "target": "quarry-rebuilds-nightly-at-0300"
+    },
+    {
+      "id": "C05",
+      "tier": "disjoint",
+      "query": "the totals I am looking at seem old",
+      "target": "quarry-rebuilds-nightly-at-0300"
+    },
+    {
+      "id": "C06",
+      "tier": "disjoint",
+      "query": "you are guessing again instead of looking",
+      "target": "show-the-failure-before-proposing-a-fix"
+    },
+    {
+      "id": "C07",
+      "tier": "disjoint",
+      "query": "everything froze when we added more machines",
+      "target": "connection-pool-capped-at-twenty"
+    },
+
+    {
+      "id": "D01",
+      "tier": "out-of-scope",
+      "query": "what is our incident postmortem template",
+      "target": null
+    },
+    {
+      "id": "D02",
+      "tier": "out-of-scope",
+      "query": "which cloud region is the primary",
+      "target": null
+    },
+    {
+      "id": "D03",
+      "tier": "out-of-scope",
+      "query": "how long do we retain customer backups",
+      "target": null
+    },
+    {
+      "id": "D04",
+      "tier": "out-of-scope",
+      "query": "who owns the billing service",
+      "target": null
+    },
+    {
+      "id": "D05",
+      "tier": "out-of-scope",
+      "query": "what is the office wifi password",
+      "target": null
+    },
+    {
+      "id": "D06",
+      "tier": "out-of-scope",
+      "query": "how do I roast coffee beans at home",
+      "target": null
+    }
+  ]
+}

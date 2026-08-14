@@ -286,53 +286,167 @@ common case and it is not an error.
 ### Three stages
 
 1. **Tokenise.** Lowercase, split on non-alphanumerics, drop stopwords and
-   anything under three characters, keep at most twelve. A prompt is a sentence,
-   not a query: without stopword removal, "how do we" matches every file
-   containing "we" and the prefilter stops filtering.
+   anything under three characters, lightly stem what is left, keep at most
+   twelve. A prompt is a sentence, not a query: without stopword removal, "how
+   do we" matches every file containing "we" and the prefilter stops filtering.
+
+   The stopword list includes `before`, `after`, `while`, `about` and `during`.
+   That is not tidiness. A title hit is the strongest signal this scorer has, so
+   leaving a temporal preposition in the query lets it score a full title hit on
+   a memory that has nothing to do with the question — measurably: *"before we
+   start"* used to return two unrelated memories, and *"any reason not to push
+   right before dinner"* used to return **Show the actual failure output before
+   proposing a fix**, purely on the word `before` in its title.
+
+   The stem is deliberately dull: tokens longer than six characters keep their
+   first six, and a 4-to-6 character plural loses its `s` unless it ends in
+   `ss`. So `credentials → creden`, `restarting → restar`, `rows → row`, while
+   `process` is left alone. Matching is anchored to the start of a word (below),
+   so a shorter token still cannot match mid-word.
 2. **Prefilter.** One `grep -ril -E` over the store with the tokens as an
    alternation. Flat store, `-maxdepth 1`, NUL-safe enumeration.
 3. **Score.** One `awk` pass over the survivors, reading at most
    `EVE_MAX_LINES` lines each.
 
-### The weights, and the one that is not fixed
+### The weights
+
+A memory scores **once per distinct query term it matches**, at the weight of
+the best field that term landed in — not once per field, and not once per
+occurrence.
 
 | Signal | Weight |
 |---|---|
-| query token in the **title** | 10 |
-| in the **filename** (the id) | 6 |
-| in **tags** | 5 |
-| in the **body** | 2, per distinct token — never per occurrence |
-| coverage: fraction of query tokens matched | up to 3 |
-| `type: feedback` | +2 |
+| term in the **title** | 6 |
+| term in the **filename** (the id) | 5 |
+| term in **tags** | 4 |
+| term in the **body** | 4 |
+| same term in more than one of those | +1 |
+| × coverage | × (1 + 0.5 × fraction of query terms matched) |
+| × rarity, per term | × 1 / (1 + log df) |
+| `type: feedback` | × 1.2 |
 | `status: superseded` | × 0.35 |
 
-Two of these are worth explaining, because both were bugs first.
+Four of these are worth explaining, because all four were bugs first.
 
-**The body is capped per token, not counted per occurrence.** Counting
+**Best field, not the sum of fields.** Summing meant one word in the title *and*
+the filename *and* the body scored 18 and decided the search by itself. Taking
+the best field means the score measures **how many different parts of the
+question a memory answers**. Three distinct body terms now score 12 and beat a
+single title word at 6 — which is the right way round, because the body is where
+`Why:` and `How to apply:` live, and a memory whose reasoning answers three
+parts of the question is a better answer than one whose title shares a word.
+
+**The body is scored per distinct term, never per occurrence.** Counting
 occurrences means the longest, most repetitive file wins, which is the opposite
 of what a curated store is for.
 
-**A token that appears in more than half the candidates has its weight cut to a
-quarter.** After stopword removal a real prompt still carries words like
-"service", "records" or "rebuild" that appear in most of the store. Weighted
-equally, six such words outscore an exact title match, and the top hits become
-whichever files are longest — with answers plausible enough that you do not
-notice. This is a crude stand-in for inverse document frequency, computed over
-the candidate set rather than the whole store, and it costs one array.
+**Coverage multiplies, it does not add.** Added, it was free score: a one-word
+query matches one word, coverage is a perfect 1.0, and a memory with a single
+generic body word collected the whole bonus. That is exactly what made *"before
+we start"* return two memories at scores of 8 and 7.
+
+**Rare terms count for more, and the weight depends on `df` alone.** After
+stopword removal a real prompt still carries words like "service", "records" or
+"rebuild" that appear in most of the store; weighted equally, six such words
+outscore an exact title match and the top hits become whichever files are
+longest. So a term unique to one memory is worth full price, a term in three is
+worth about half, a term in ten about a third — and nothing is ever worth zero.
+
+The textbook form divides by the size of the collection. Eve does not, and that
+is deliberate on two counts. Walking the store a second time to count it
+measured **+11 ms on a 2000-memory store**, more than this entire change costs.
+Dividing by the number of *candidates* instead is a bug that hides in plain
+sight: a query matching exactly one memory has `df == candidates`, so its one
+true answer is judged "a word everything contains" and crushed — measured under
+that divisor, *"will restarting the box interrupt whoever is testing"* scored its
+correct answer at **1**. Dropping the collection size entirely measured better
+than either on the 45-question suite: same recall@1, one fewer misfire, and all
+seven disjoint controls silent instead of six.
+
+Matching is anchored to the start of a word. Every haystack is normalised to
+space-separated, space-padded text, and a term is looked up with a leading
+space — so `live` still matches `lives` and `live`, and no longer matches
+`delivery`. Unanchored matching was why lowering the gate used to surface
+memories that share no word with the question.
 
 `superseded` is demoted rather than dropped, because a tombstone you cannot find
 is a deletion with extra steps ([05-design-laws.md](05-design-laws.md), law 4).
 
-### The relevance gate
+### The two relevance gates
 
-`EVE_MIN_SCORE` (default 6) is the floor. Below it, a candidate is not shown at
-all. Roughly: a title hit alone clears it, a tag hit alone does not, and several
-body-only terms are borderline. Raise it if recall is noisy, lower it if the
-store is too quiet — but look at the actual numbers first:
+**The absolute gate**, `EVE_MIN_SCORE` (default 7), is the noise floor. One
+generic body word scores under it; two distinct body terms, or one distinctive
+term in a title, clear it. Below the floor a candidate is not shown at all.
+
+**The relative gate** is about the second and third hit, and it has no knob.
+Once one memory is clearly the best answer, the runners-up are usually there on
+one shared word, and each one spends context making the real answer harder to
+see. Anything scoring under 60% of the leader is dropped. It cannot let junk in
+by itself — a candidate still has to clear the absolute gate first — and the
+leader always survives it.
+
+`--all` turns off **both**, because the whole point of `--all` is to answer "why
+did that not come back", and a filter you cannot see makes that unanswerable:
 
 ```sh
 eve search --query "the prompt that disappointed you" --all --format tsv
 ```
+
+Raise the floor if retrieval is noisy, lower it if the store is too quiet — but
+read the scores first, and know that lowering it is the classic way to make
+retrieval *look* better while making it worse. Measured on the 45-question suite
+in [`evals/recall/`](../evals/recall/): dropping the floor from 7 to 2 buys
+paraphrase recall@3 **80% → 90%** and costs misfires **2 → 12** (4% → 27% of the
+suite), with four of the six out-of-scope controls no longer silent. That is the
+trade you are making.
+
+### When to expect a miss
+
+Keyword retrieval has a ceiling, and it is worth stating plainly so a quiet
+result is not read as a broken install.
+
+Eve finds a memory when the prompt and the memory **share a word** — after
+stopwords, after stemming, anywhere in the title, filename, tags, `Why:` or
+`How to apply:`. It does not know that *"seeing the same record twice while
+scrolling"* is what *"offset pagination skipped rows under write load"* feels
+like from the outside. Every term in that question scores zero against that
+memory, and there is nothing for any weighting to weight. No amount of tuning
+fixes it; only rewriting the memory to contain the words you would actually
+reach for, or a different kind of index, does.
+
+Measured on a fixed 25-query set against an 8-memory store: **8/8** when the
+question reuses the memory's own vocabulary, **9/14** on realistic paraphrases,
+**3/3** correctly silent on out-of-scope questions.
+
+The five paraphrase misses are worth being precise about, because they are two
+different failures and only one of them is fixable:
+
+- **Three score literally zero.** *"whats the latest I can release today"* against
+  a memory that says *deploy*, *18:00 UTC* and *next morning*; *"clients report
+  seeing the same record twice when scrolling"* against one that says *offset
+  pagination skipped rows under write load*. Not one term matches, so there is
+  nothing for any weighting to weight. No tuning reaches these.
+- **Two score 3 and 4 against a floor of 7** — one weak term each: *"can we ship
+  this evening"* catches `ship` inside *shipments*, *"zero downtime rollout on
+  staging"* catches `staging`, which two memories share. Lowering the floor
+  would retrieve them and, on the same measurement, would also retrieve four
+  out-of-scope questions. That is the trade in the previous section.
+
+Two consequences worth acting on:
+
+- **Write the words you would search for into the memory.** The `Why:` section
+  is searchable now; a sentence naming the symptom the way a colleague would
+  report it ("callers see duplicate rows while paging") is worth more than a
+  precise sentence nobody would type.
+- **Read your own misses.** Every empty retrieval is appended to
+  `state/whiffs.log`, and `eve gaps` groups them. That file is the list of
+  questions your store could not answer, in your own words — it is the highest
+  quality input to "what should I write down next" that this system produces.
+  Run it occasionally:
+
+  ```sh
+  eve gaps
+  ```
 
 ### Two things that are not memories
 

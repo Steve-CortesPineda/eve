@@ -1,0 +1,46 @@
+{
+  "_note": "Measured floor, not a target. run.sh fails if recall falls below this or misfires rise above it. Regenerate with --update-baseline and say in the commit message what changed and why.",
+  "overall": {
+    "answerable": 39,
+    "empty": 15,
+    "hit1": 27,
+    "hit3": 28,
+    "misfire": 2,
+    "misrank": 1,
+    "n": 45
+  },
+  "per_tier": {
+    "disjoint": {
+      "empty": 7,
+      "hit1": 0,
+      "hit3": 0,
+      "misfire": 0,
+      "misrank": 0,
+      "n": 7
+    },
+    "out-of-scope": {
+      "empty": 6,
+      "hit1": 0,
+      "hit3": 0,
+      "misfire": 0,
+      "misrank": 0,
+      "n": 6
+    },
+    "paraphrase": {
+      "empty": 2,
+      "hit1": 15,
+      "hit3": 16,
+      "misfire": 2,
+      "misrank": 1,
+      "n": 20
+    },
+    "verbatim": {
+      "empty": 0,
+      "hit1": 12,
+      "hit3": 12,
+      "misfire": 0,
+      "misrank": 0,
+      "n": 12
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "name": "eve",
+  "displayName": "Eve",
+  "version": "1.0.0",
+  "description": "Cross-session memory for Claude Code. A curated store of markdown files under ~/.eve, recalled automatically on every prompt. POSIX sh and awk; no dependencies, no network, no telemetry.",
+  "author": {
+    "name": "Steve-CortesPineda",
+    "url": "https://github.com/Steve-CortesPineda"
+  },
+  "homepage": "https://github.com/Steve-CortesPineda/eve#readme",
+  "repository": "https://github.com/Steve-CortesPineda/eve",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "context",
+    "recall",
+    "grounding",
+    "knowledge-base"
+  ],
+  "commands": [
+    "./.claude-plugin/commands/eve-setup.md"
+  ],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/eve-recall.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/eve-session-start.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/eve-session-end.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

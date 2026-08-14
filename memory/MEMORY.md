@@ -15,6 +15,12 @@ Conventions, in short (full rules in [docs/02-memory-format.md](../docs/02-memor
   real store, generate it. An index you maintain by hand drifts from the files
   it describes, and an index that lies is worse than no index at all.
 
+> **This file is not your index.** It is a sample of the one-line convention,
+> listing this repo's fictional examples, and it stays in the clone. Your store's
+> index is `~/.eve/INDEX.md` — created by `scripts/new-memory.sh` and regenerated
+> from the files by `eve index`. That is the path the `CLAUDE.md` rule block
+> names, and the only one your agent is told to read.
+
 ---
 
 ## Standing rules
