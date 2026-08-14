@@ -214,12 +214,38 @@ eve_disabled() {
 # a question the shell can answer with none. When the glob matches nothing the
 # shell leaves the pattern itself in $_eve_f and the -f test fails, which is the
 # answer we want. The store is flat by contract, so a glob is also complete.
+# Approximate size of the store, cached.
+#
+# The only caller is the dedupe window, which needs a ballpark rather than a
+# census -- it is choosing how many recently-shown files to exclude. That
+# distinction is what makes caching safe here and it is why this must not grow
+# a second caller that needs an exact count.
+#
+# Globbing the directory costs ~55 ms at 2,000 files, and this runs on EVERY
+# prompt, so an uncached walk is most of the per-prompt budget on a large store.
+# The cache is invalidated by the directory's own mtime: adding or removing a
+# file touches the directory, which is exactly when the count changes. Editing a
+# file does not, and does not need to.
 eve_store_count() {
-	_eve_n=0
 	[ -d "$EVE_MEMORY_DIR" ] || {
 		printf '0'
 		return 0
 	}
+	_eve_cache=$EVE_STATE_DIR/store-count
+	# `find -newer` avoids stat(1), whose format flags differ between BSD and GNU.
+	if [ -f "$_eve_cache" ] &&
+		[ -z "$(find "$EVE_MEMORY_DIR" -maxdepth 0 -newer "$_eve_cache" 2>/dev/null)" ]; then
+		_eve_n=$(cat "$_eve_cache" 2>/dev/null) || _eve_n=''
+		case $_eve_n in
+		'' | *[!0-9]*) ;; # unreadable or corrupt: fall through and recount
+		*)
+			printf '%s' "$_eve_n"
+			return 0
+			;;
+		esac
+	fi
+
+	_eve_n=0
 	for _eve_f in "$EVE_MEMORY_DIR"/*.md; do
 		[ -f "$_eve_f" ] || continue
 		case "${_eve_f##*/}" in
@@ -227,6 +253,11 @@ eve_store_count() {
 		esac
 		_eve_n=$((_eve_n + 1))
 	done
+	# Best-effort: a store we cannot write to still returns the right number.
+	if eve_ensure_state 2>/dev/null; then
+		printf '%s' "$_eve_n" >"$_eve_cache.tmp" 2>/dev/null &&
+			mv "$_eve_cache.tmp" "$_eve_cache" 2>/dev/null || :
+	fi
 	printf '%s' "$_eve_n"
 }
 

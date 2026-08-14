@@ -1,0 +1,949 @@
+#!/bin/sh
+# eve-bench -- measure the prompt-path hook on THIS machine.
+#
+# WHY THIS EXISTS
+#   Every tuning constant in Eve (EVE_CANDIDATE_CAP, EVE_MAX_LINES, the
+#   fork-free config parser) was chosen against measurements taken on one fast
+#   laptop with a warm page cache. That is a fine way to pick a default and a
+#   terrible way to make a promise. An older Intel box, a spinning disk, an
+#   encrypted or network-mounted $EVE_HOME, an EDR agent that inspects every
+#   exec -- any of these can multiply these numbers, and none of them are
+#   visible from here. So the tool measures the machine it is on instead of
+#   quoting the machine it was written on.
+#
+# WHAT IT MEASURES
+#   The real thing. `hooks/eve-recall.sh`, invoked the way the harness invokes
+#   it -- a shell hop, then the hook, then JSON on stdin -- against YOUR store.
+#   Nothing is stubbed, no inner function is called directly, and the numbers
+#   include process startup, config parsing, retrieval and the dedupe write.
+#
+#   Two runs, not one:
+#     1. against your store          -> what a prompt actually costs
+#     2. against a 1-memory store    -> the fixed floor: startup and forks
+#   The difference between them is the only part that store size can explain.
+#   On a small store the floor is nearly the whole number, and knowing that
+#   stops you from optimising a search that was never the problem.
+#
+# WHY p50 AND p95 AND NOT A MEAN
+#   A mean hides the tail, and the tail is what a person feels. A hook that is
+#   usually 80 ms and occasionally 900 ms reads as "sometimes Claude hangs",
+#   and its mean looks fine.
+#
+# THE BUDGET
+#   250 ms at p95. docs/03-hooks.md states the rule this defends: a hook that
+#   adds a second to every prompt gets uninstalled, and the memory system dies
+#   with it. 250 ms is a quarter of that -- deliberately set where the cost is
+#   still only measurable, so it trips long before a user starts noticing.
+#   This is overhead paid on EVERY prompt and it buys the user nothing directly;
+#   it earns its keep only through what the model does with the recalled text.
+#
+# CONTRACT
+#   Never hangs: every phase has a wall-clock deadline and (where the clock
+#   allows) a per-run timeout. Never writes to your gaps log, never leaves state
+#   behind, never modifies a memory file. Exit 0 if p95 is inside the budget,
+#   1 if it is not, 2 if the machine has no millisecond clock to measure with.
+#
+# POSIX sh. Optional python3 (better clock, per-run timeouts); falls back to
+# `date +%s%N` where that exists; says so plainly when neither is available.
+
+set -u
+
+LC_ALL=C
+export LC_ALL
+
+EVE_HOME=${EVE_HOME:-"$HOME/.eve"}
+RUNS=20
+WARMUP=3
+BUDGET_MS=250
+DEADLINE=25 # seconds per phase
+JSON=0
+QUERY=''
+HOOK=''
+WANT_CLOCK=auto
+
+usage() {
+	cat <<'USAGE'
+usage: eve bench [--runs N] [--warmup N] [--budget MS] [--deadline SEC]
+                 [--query TEXT] [--clock auto|python3|date] [--eve-home PATH]
+                 [--hook PATH] [--json]
+
+Times the real recall hook against your real store, and separately against a
+one-memory store, so the fixed startup floor can be told apart from the cost
+of searching what you have written.
+
+  --runs N        timed runs per phase (default 20)
+  --warmup N      runs discarded first, to warm the page cache (default 3)
+  --budget MS     p95 budget to judge against (default 250)
+  --deadline SEC  wall-clock cap per phase (default 25). Checked between runs,
+                  so the true worst case is one deadline plus one per-run
+                  timeout (max(5, SEC/2) seconds) per phase. Cut short and
+                  reported as truncated rather than left to hang.
+  --query TEXT    the prompt to search for. Default: a query built from your
+                  first memory's title, so a healthy store must hit.
+  --clock WHICH   auto (default), python3, or date. `date` uses `date +%s%N`
+                  and is cheaper to start but charges each sample for the fork
+                  that reads the end time -- a couple of ms of overstatement.
+  --eve-home PATH default $EVE_HOME, else ~/.eve
+  --hook PATH     time a different script instead of $EVE_HOME/hooks/
+                  eve-recall.sh. For testing the harness itself.
+  --json          one machine-readable object instead of the report
+
+Exit status: 0 if p95 is at or under the budget, 1 if it is over, 2 if this
+machine offers no millisecond clock (neither python3 nor `date +%s%N`).
+
+Nothing here writes to your store: the whiff log is disabled for the duration,
+state files are removed afterwards, and no memory file is opened for writing.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--runs) [ $# -ge 2 ] || { echo "eve-bench: --runs needs a value" >&2; exit 64; }; RUNS=$2; shift 2 ;;
+	--runs=*) RUNS=${1#--runs=}; shift ;;
+	--warmup) [ $# -ge 2 ] || { echo "eve-bench: --warmup needs a value" >&2; exit 64; }; WARMUP=$2; shift 2 ;;
+	--warmup=*) WARMUP=${1#--warmup=}; shift ;;
+	--budget) [ $# -ge 2 ] || { echo "eve-bench: --budget needs a value" >&2; exit 64; }; BUDGET_MS=$2; shift 2 ;;
+	--budget=*) BUDGET_MS=${1#--budget=}; shift ;;
+	--deadline) [ $# -ge 2 ] || { echo "eve-bench: --deadline needs a value" >&2; exit 64; }; DEADLINE=$2; shift 2 ;;
+	--deadline=*) DEADLINE=${1#--deadline=}; shift ;;
+	--query) [ $# -ge 2 ] || { echo "eve-bench: --query needs a value" >&2; exit 64; }; QUERY=$2; shift 2 ;;
+	--query=*) QUERY=${1#--query=}; shift ;;
+	--clock) [ $# -ge 2 ] || { echo "eve-bench: --clock needs a value" >&2; exit 64; }; WANT_CLOCK=$2; shift 2 ;;
+	--clock=*) WANT_CLOCK=${1#--clock=}; shift ;;
+	--eve-home) [ $# -ge 2 ] || { echo "eve-bench: --eve-home needs a path" >&2; exit 64; }; EVE_HOME=$2; shift 2 ;;
+	--eve-home=*) EVE_HOME=${1#--eve-home=}; shift ;;
+	--hook) [ $# -ge 2 ] || { echo "eve-bench: --hook needs a path" >&2; exit 64; }; HOOK=$2; shift 2 ;;
+	--hook=*) HOOK=${1#--hook=}; shift ;;
+	--json) JSON=1; shift ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "eve-bench: unknown option: $1" >&2; exit 64 ;;
+	esac
+done
+
+intval() { # VALUE DEFAULT
+	case "${1:-}" in
+	'' | *[!0-9]*) printf '%s' "$2" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+RUNS=$(intval "$RUNS" 20)
+WARMUP=$(intval "$WARMUP" 3)
+BUDGET_MS=$(intval "$BUDGET_MS" 250)
+DEADLINE=$(intval "$DEADLINE" 25)
+[ "$RUNS" -ge 3 ] || RUNS=3
+[ "$DEADLINE" -ge 2 ] || DEADLINE=2
+
+case "$EVE_HOME" in /*) ;; *) EVE_HOME="$(pwd)/$EVE_HOME" ;; esac
+EVE_HOME=$(printf '%s' "$EVE_HOME" | sed -e 's|//*|/|g' -e 's|/$||')
+MEMDIR="$EVE_HOME/memory"
+
+# Where this script is, so it can be run out of a clone before install.
+_self=$0
+case "$_self" in
+*/*) SELFDIR=$(cd "$(dirname "$_self")" 2>/dev/null && pwd) || SELFDIR='' ;;
+*) SELFDIR=$(pwd) ;;
+esac
+
+die() {
+	printf 'eve-bench: %s\n' "$1" >&2
+	exit "${2:-1}"
+}
+
+TMPD=''
+BENCH_TAG="eve-bench-$$"
+cleanup() {
+	# Leave no trace. The hook writes state/seen-<sid> on every hit, and a
+	# benchmark that fills your state directory with its own session ids is
+	# a benchmark that changes the thing it measured.
+	if [ -d "$EVE_HOME/state" ]; then
+		rm -f "$EVE_HOME/state/seen-$BENCH_TAG"* 2>/dev/null || :
+	fi
+	[ -n "$TMPD" ] && [ -d "$TMPD" ] && rm -rf "$TMPD" 2>/dev/null
+	return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' HUP INT TERM
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/eve-bench.XXXXXX") || die "cannot create a temp directory"
+
+# --------------------------------------------------------------------------
+# What we are about to run
+# --------------------------------------------------------------------------
+
+if [ -z "$HOOK" ]; then
+	if [ -x "$EVE_HOME/hooks/eve-recall.sh" ]; then
+		HOOK="$EVE_HOME/hooks/eve-recall.sh"
+	elif [ -n "$SELFDIR" ] && [ -x "$SELFDIR/../hooks/eve-recall.sh" ]; then
+		HOOK=$(cd "$SELFDIR/.." 2>/dev/null && pwd)/hooks/eve-recall.sh
+	fi
+fi
+[ -n "$HOOK" ] && [ -f "$HOOK" ] || die "no recall hook found at $EVE_HOME/hooks/eve-recall.sh (run ./install.sh)" 69
+
+EVE_BIN=''
+if [ -x "$EVE_HOME/bin/eve" ]; then
+	EVE_BIN="$EVE_HOME/bin/eve"
+elif [ -n "$SELFDIR" ] && [ -x "$SELFDIR/eve" ]; then
+	EVE_BIN="$SELFDIR/eve"
+fi
+[ -n "$EVE_BIN" ] || die "no eve binary at $EVE_HOME/bin/eve (run ./install.sh)" 69
+
+# --------------------------------------------------------------------------
+# The clock
+# --------------------------------------------------------------------------
+#
+# Two tiers, and the order is deliberate.
+#
+# python3 first, even though it is the heavier dependency: the timed region is
+# inside a single long-lived python process, so python's own startup is not in
+# any sample, and `subprocess.run(timeout=)` gives a per-run kill switch that
+# POSIX sh cannot provide (there is no portable timeout(1)).
+#
+# `date +%s%N` second: fine where it exists, but each t1 includes the fork/exec
+# of the `date` that reads it -- a systematic overstatement of roughly one fork,
+# a couple of milliseconds.
+#
+# Older BSD and older macOS `date` have no %N: they exit 0 and print a literal
+# trailing "N", so an exit-status check passes and the arithmetic then silently
+# does nothing sensible. Newer Darwin does support it. The probe below therefore
+# checks that the output is all digits and long enough to be nanoseconds, rather
+# than assuming either way from the platform name.
+
+have_python3() {
+	_py=$(command -v python3 2>/dev/null) || return 1
+	[ -n "$_py" ] || return 1
+	case "$_py" in
+	/usr/bin/python3)
+		# On macOS this path can be a Command Line Tools stub that pops a GUI
+		# installer when run. Only trust it if the tools are really installed.
+		[ "$(uname -s 2>/dev/null)" = "Darwin" ] && { xcode-select -p >/dev/null 2>&1 || return 1; }
+		;;
+	esac
+	# Then actually run it. hooks/lib/common.sh deliberately stops at the path
+	# check because it is on the per-prompt path and cannot afford the fork;
+	# this is a one-off command and can. A python3 on $PATH that exits non-zero
+	# is not a hypothetical -- it is what a shim, a broken venv or a half-removed
+	# install looks like, and inferring "python works" from "python exists" is
+	# how you end up reporting no samples instead of the reason.
+	python3 -c 'import json, subprocess, time' >/dev/null 2>&1
+}
+
+have_ns_date() {
+	_t=$(date +%s%N 2>/dev/null) || return 1
+	case "$_t" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "${#_t}" -ge 16 ]
+}
+
+CLOCK=none
+case "$WANT_CLOCK" in
+python3) have_python3 && CLOCK=python3 ;;
+date) have_ns_date && CLOCK=date ;;
+auto)
+	if have_python3; then
+		CLOCK=python3
+	elif have_ns_date; then
+		CLOCK=date
+	fi
+	;;
+*) die "--clock must be auto, python3 or date" 64 ;;
+esac
+
+# --------------------------------------------------------------------------
+# The store, as it actually is
+# --------------------------------------------------------------------------
+
+: >"$TMPD/mem.list"
+if [ -d "$MEMDIR" ]; then
+	# The same four exclusions `eve search` and the doctor use. A list that
+	# disagrees with that one is a bug: it would count the template as a memory
+	# and then report a retrieval failure that is really a counting failure.
+	find "$MEMDIR" -maxdepth 1 -type f -name '*.md' \
+		! -name 'TEMPLATE.md' ! -name 'INDEX.md' ! -name 'MEMORY.md' ! -name 'README.md' \
+		-print >"$TMPD/mem.list" 2>/dev/null || : >"$TMPD/mem.list"
+fi
+MEM_COUNT=$(wc -l <"$TMPD/mem.list" | tr -d ' ')
+MEM_COUNT=$(intval "$MEM_COUNT" 0)
+
+STORE_BYTES=0
+LARGEST_BYTES=0
+if [ "$MEM_COUNT" -gt 0 ]; then
+	# One pass, and `wc -c` only stats regular files, so this stays cheap even
+	# on a store far larger than anyone should have.
+	set -- $(tr '\n' '\0' <"$TMPD/mem.list" | xargs -0 wc -c 2>/dev/null |
+		awk '$2 != "total" { s += $1; if ($1 > m) m = $1 } END { printf "%d %d\n", s + 0, m + 0 }')
+	STORE_BYTES=$(intval "${1:-0}" 0)
+	LARGEST_BYTES=$(intval "${2:-0}" 0)
+fi
+
+# Effective config, resolved the way the scripts resolve it: environment first,
+# then the file, then the built-in default. Printing the file would answer a
+# different question from the one being asked.
+cfg() { # NAME DEFAULT
+	_n=$1
+	_d=$2
+	eval "_v=\${$_n-}"
+	if [ -n "${_v:-}" ]; then
+		printf '%s\n' "$_v"
+		return 0
+	fi
+	if [ -f "$EVE_HOME/config" ]; then
+		_v=$(sed -n "s/^[[:space:]]*$_n[[:space:]]*=[[:space:]]*//p" "$EVE_HOME/config" |
+			sed -e 's/[[:space:]]*$//' -e 's/[[:space:]]*#.*$//' | sed -n '1p')
+		if [ -n "$_v" ]; then
+			printf '%s\n' "$_v"
+			return 0
+		fi
+	fi
+	printf '%s\n' "$_d"
+}
+
+CFG_ENGINE=$(cfg EVE_ENGINE awk)
+CFG_CANDCAP=$(cfg EVE_CANDIDATE_CAP 300)
+CFG_DISABLE=$(cfg EVE_DISABLE 0)
+# Verified by running it, not by finding it on $PATH. Whether jq works is a
+# claim this command makes in its recommendation, and a jq that exits non-zero
+# would make that recommendation wrong in the one direction that wastes the
+# reader's time ("install jq" -- it is installed).
+HAVE_JQ=no
+jq --version >/dev/null 2>&1 && HAVE_JQ=yes
+
+# Is an alternative retrieval engine installed? Detected, never assumed: if a
+# clone does not ship one, the recommendation below must not send the reader
+# looking for a file that is not there.
+ALT_ENGINE=''
+for _c in "$EVE_HOME/bin/eve-engine-sqlite" "${SELFDIR:-.}/eve-engine-sqlite" \
+	"${SELFDIR:-.}/../engines/sqlite/eve-engine-sqlite"; do
+	if [ -x "$_c" ]; then
+		ALT_ENGINE=sqlite
+		break
+	fi
+done
+
+# --------------------------------------------------------------------------
+# The query
+# --------------------------------------------------------------------------
+#
+# Default to a query built from a real memory's title, so a healthy store must
+# return something. That is on purpose: the hit path is the expensive one (it
+# formats a block and writes the dedupe file), so timing a hit is the honest,
+# conservative choice. Timing a query that matches nothing would flatter Eve.
+
+if [ -z "$QUERY" ]; then
+	if [ "$MEM_COUNT" -gt 0 ]; then
+		first=$(sed -n '1p' "$TMPD/mem.list")
+		q=$(sed -n 's/^title:[[:space:]]*//p' "$first" 2>/dev/null | sed -n '1p')
+		if [ -z "$q" ]; then
+			b=${first##*/}
+			q=$(printf '%s' "${b%.md}" | tr '-' ' ')
+		fi
+		QUERY="what do we know about $q"
+	else
+		QUERY="what do we know about this project"
+	fi
+fi
+# One line, bounded. A 40 KB prompt is a different benchmark.
+QUERY=$(printf '%s' "$QUERY" | tr '\n\t' '  ' | cut -c1-300)
+
+# --------------------------------------------------------------------------
+# The floor store: one memory, otherwise identical
+# --------------------------------------------------------------------------
+#
+# Same hook, same eve binary, same config -- only the store is different. What
+# is left when you subtract this is the part of the cost that store size can
+# explain. Everything else is fork/exec, the shell, the config parse and the
+# JSON parse, and no amount of index work will move it.
+#
+# It must hold exactly one REAL memory, not zero: an empty store makes the hook
+# exit early at the `eve_store_ready` check, which measures the disabled path
+# and would report a floor of about 6 ms that no prompt ever pays.
+
+FLOOR_HOME="$TMPD/floor"
+mkdir -p "$FLOOR_HOME/memory" "$FLOOR_HOME/state" "$FLOOR_HOME/bin" || die "cannot build the floor store"
+if ! ln -s "$EVE_BIN" "$FLOOR_HOME/bin/eve" 2>/dev/null; then
+	cp "$EVE_BIN" "$FLOOR_HOME/bin/eve" 2>/dev/null || die "cannot place eve in the floor store"
+	chmod 755 "$FLOOR_HOME/bin/eve" 2>/dev/null || :
+fi
+# Copy the real config so the two phases differ in store size and in nothing
+# else. A user who lowered EVE_CANDIDATE_CAP should see that reflected in both.
+[ -f "$EVE_HOME/config" ] && cp "$EVE_HOME/config" "$FLOOR_HOME/config" 2>/dev/null
+
+cat >"$FLOOR_HOME/memory/bench-floor-probe.md" <<'FLOORMEM'
+---
+title: bench floor probe memory for latency measurement
+type: note
+status: current
+tags: [bench]
+---
+
+The floor is what the recall hook costs before it searches anything: process
+startup, the config parse, the JSON parse and the dedupe bookkeeping. This file
+exists so that a store of exactly one memory can be searched successfully.
+FLOORMEM
+FLOOR_QUERY="what is the bench floor probe memory for latency measurement"
+
+# --------------------------------------------------------------------------
+# Running a phase
+# --------------------------------------------------------------------------
+#
+# Each phase writes one duration in milliseconds per line to $TMPD/<name>.ms,
+# plus a meta line to $TMPD/<name>.meta. Both clock tiers produce the same two
+# files, so the statistics below are computed by one piece of code regardless of
+# which clock ran -- there is no second implementation to drift.
+#
+# Invocation matches the harness: `sh -c 'exec "$0"' HOOK` with the payload on
+# stdin. The harness runs the command string from settings.json through a shell,
+# so the shell hop is a real cost of every prompt and belongs in the number.
+#
+# Environment forced for the duration, and each one is a correctness fix:
+#   EVE_DISABLE=0    otherwise a user with the kill switch on benchmarks the
+#                    kill switch and is told everything is wonderfully fast
+#   EVE_WHIFF_LOG=0  a benchmark must not write 20 rows into `eve gaps`
+#   EVE_DEBUG=0      or we would be timing the debug log as well
+# A fresh session id per run keeps every run a first-turn run: without that the
+# dedupe window fills, later runs go to the miss path, and the phase measures
+# two different things and averages them.
+
+run_phase_python() { # NAME HOME QUERY
+	_name=$1
+	_home=$2
+	_q=$3
+	python3 - "$HOOK" "$_home" "$_q" "$RUNS" "$WARMUP" "$BENCH_TAG-$_name" \
+		"$DEADLINE" "$TMPD/$_name.ms" "$TMPD/$_name.meta" <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys, time
+
+hook, home, query = sys.argv[1], sys.argv[2], sys.argv[3]
+runs, warm = int(sys.argv[4]), int(sys.argv[5])
+prefix, deadline = sys.argv[6], float(sys.argv[7])
+ms_path, meta_path = sys.argv[8], sys.argv[9]
+
+env = dict(os.environ)
+env.update({"EVE_HOME": home, "EVE_DISABLE": "0",
+            "EVE_WHIFF_LOG": "0", "EVE_DEBUG": "0"})
+
+# The shell hop the harness pays, and `exec` so it costs one process, not two.
+argv = ["/bin/sh", "-c", 'exec "$0"', hook]
+
+def one(tag, timeout):
+    data = json.dumps({"session_id": "%s-%s" % (prefix, tag),
+                       "prompt": query, "cwd": home}).encode()
+    t = time.perf_counter()
+    try:
+        p = subprocess.run(argv, input=data, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=env, timeout=timeout)
+        return (time.perf_counter() - t) * 1000.0, len(p.stdout), 0
+    except subprocess.TimeoutExpired:
+        return timeout * 1000.0, 0, 1
+    except Exception:
+        return None, 0, 0
+
+# Per-run timeout: generous enough that a slow machine is measured rather than
+# aborted, tight enough that a pathological store cannot wedge the command.
+per_run = max(5.0, deadline / 2.0)
+
+started = time.perf_counter()
+first = None
+for i in range(max(0, warm)):
+    ms, _, _ = one("warm%d" % i, per_run)
+    if first is None:
+        first = ms
+    if time.perf_counter() - started > deadline:
+        break
+
+# Adaptive bound. If a single run is already seconds long, twenty of them is a
+# hang from the user's point of view, and the extra samples would not change
+# the conclusion by then.
+if first is not None and first > 2000.0:
+    runs = min(runs, 5)
+
+samples, hits, timeouts, truncated = [], 0, 0, 0
+for i in range(runs):
+    # Never break before the first timed sample. On a machine slow enough that
+    # the warm-up alone blew the deadline, "no result" is the least useful
+    # answer available -- one honest, truncated sample beats it.
+    if samples and time.perf_counter() - started > deadline:
+        truncated = 1
+        break
+    ms, nbytes, to = one(i, per_run)
+    if ms is None:
+        continue
+    samples.append(ms)
+    timeouts += to
+    if nbytes > 0:
+        hits += 1
+
+with open(ms_path, "w") as fh:
+    for s in samples:
+        fh.write("%.3f\n" % s)
+with open(meta_path, "w") as fh:
+    fh.write("n=%d hits=%d timeouts=%d truncated=%d\n"
+             % (len(samples), hits, timeouts, truncated))
+PYEOF
+	[ -s "$TMPD/$_name.ms" ]
+}
+
+run_phase_date() { # NAME HOME QUERY
+	_name=$1
+	_home=$2
+	_q=$3
+	# JSON-escape once; the payloads are written before the clock starts so no
+	# sample pays for building its own input.
+	_qesc=$(printf '%s' "$_q" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+	_i=0
+	_total=$((WARMUP + RUNS))
+	while [ "$_i" -lt "$_total" ]; do
+		printf '{"session_id":"%s-%s-%s","prompt":"%s","cwd":"%s"}' \
+			"$BENCH_TAG" "$_name" "$_i" "$_qesc" "$_home" >"$TMPD/pay.$_i"
+		_i=$((_i + 1))
+	done
+
+	: >"$TMPD/$_name.ms"
+	_hits=0
+	_n=0
+	_trunc=0
+	_start=$(date +%s)
+	_i=0
+	while [ "$_i" -lt "$_total" ]; do
+		_t0=$(date +%s%N)
+		EVE_HOME="$_home" EVE_DISABLE=0 EVE_WHIFF_LOG=0 EVE_DEBUG=0 \
+			sh -c 'exec "$0"' "$HOOK" <"$TMPD/pay.$_i" >"$TMPD/$_name.out" 2>/dev/null
+		_t1=$(date +%s%N)
+		if [ "$_i" -ge "$WARMUP" ]; then
+			printf '%s\n' "$(((_t1 - _t0) / 1000000))" >>"$TMPD/$_name.ms"
+			_n=$((_n + 1))
+			[ -s "$TMPD/$_name.out" ] && _hits=$((_hits + 1))
+		fi
+		_i=$((_i + 1))
+		_now=$(date +%s)
+		# Same rule as the python driver: never stop before one timed sample
+		# exists, or a slow machine gets no answer at all.
+		if [ "$_n" -ge 1 ] && [ $((_now - _start)) -ge "$DEADLINE" ]; then
+			[ "$_i" -lt "$_total" ] && _trunc=1
+			break
+		fi
+	done
+	printf 'n=%s hits=%s timeouts=0 truncated=%s\n' "$_n" "$_hits" "$_trunc" >"$TMPD/$_name.meta"
+	rm -f "$TMPD"/pay.* 2>/dev/null || :
+	[ -s "$TMPD/$_name.ms" ]
+}
+
+run_phase() { # NAME HOME QUERY
+	case "$CLOCK" in
+	python3) run_phase_python "$1" "$2" "$3" ;;
+	date) run_phase_date "$1" "$2" "$3" ;;
+	*) return 1 ;;
+	esac
+}
+
+# --------------------------------------------------------------------------
+# Statistics
+# --------------------------------------------------------------------------
+#
+# Nearest-rank percentiles over the sorted samples: p50 is the value at rank
+# ceil(0.50n), p95 at ceil(0.95n). With the default 20 runs, p95 is the
+# second-slowest sample. That is a coarse tail estimate and it is stated as such
+# in the report rather than dressed up -- twenty samples cannot support more.
+
+pct() { # FILE P  -> integer ms
+	sort -n "$1" 2>/dev/null | awk -v p="$2" '
+    { v[NR] = $1 + 0 }
+    END {
+      if (NR == 0) { print 0; exit }
+      i = int(p * NR + 0.999999)
+      if (i < 1) i = 1
+      if (i > NR) i = NR
+      printf "%.0f\n", v[i]
+    }'
+}
+
+statline() { # FILE -> "min max n"
+	sort -n "$1" 2>/dev/null | awk '
+    { v[NR] = $1 + 0 }
+    END {
+      if (NR == 0) { print "0 0 0"; exit }
+      printf "%.0f %.0f %d\n", v[1], v[NR], NR
+    }'
+}
+
+meta_get() { # FILE KEY DEFAULT
+	_v=$(sed -n "s/.*[[:space:]]*$2=\([0-9][0-9]*\).*/\1/p" "$1" 2>/dev/null | sed -n '1p')
+	[ -n "$_v" ] || _v=$3
+	printf '%s' "$_v"
+}
+
+human_bytes() { # BYTES
+	awk -v b="${1:-0}" 'BEGIN {
+    if (b < 1024) { printf "%d B\n", b }
+    else if (b < 1048576) { printf "%.1f KB\n", b / 1024 }
+    else { printf "%.1f MB\n", b / 1048576 }
+  }'
+}
+
+# --------------------------------------------------------------------------
+# Run
+# --------------------------------------------------------------------------
+
+if [ "$CLOCK" = none ]; then
+	if [ "$JSON" -eq 1 ]; then
+		printf '{"ok":false,"reason":"no-millisecond-clock"}\n'
+	else
+		cat <<EOF
+eve-bench: this machine has no millisecond clock I can use.
+
+  python3    not on \$PATH, or the macOS Command Line Tools stub, or present
+             but exiting non-zero
+  date +%s%N not supported here: it returned something that is not a
+             nanosecond count (older BSD and older macOS print a literal "N")
+
+Install either one and re-run. Until then the only measurement available is a
+batch mean, which you can take by hand -- it hides the tail, so treat it as a
+smoke test rather than a result:
+
+  time (i=0; while [ \$i -lt 20 ]; do
+    printf '{"prompt":"how do we handle retries","session_id":"bench"}' \\
+      | $HOOK >/dev/null
+    i=\$((i + 1))
+  done)
+EOF
+	fi
+	exit 2
+fi
+
+REAL_OK=1
+run_phase real "$EVE_HOME" "$QUERY" || REAL_OK=0
+
+# If the preferred clock produced nothing, try the other one before giving up.
+# The clock is an implementation detail of the measurement; a machine where
+# python3 is present but broken should still get a number, not an apology.
+if [ "$REAL_OK" -eq 0 ] && [ "$WANT_CLOCK" = auto ]; then
+	case "$CLOCK" in
+	python3) have_ns_date && CLOCK=date ;;
+	date) have_python3 && CLOCK=python3 ;;
+	esac
+	REAL_OK=1
+	run_phase real "$EVE_HOME" "$QUERY" || REAL_OK=0
+fi
+
+FLOOR_OK=1
+run_phase floor "$FLOOR_HOME" "$FLOOR_QUERY" || FLOOR_OK=0
+
+if [ "$REAL_OK" -eq 0 ] || [ "$FLOOR_OK" -eq 0 ]; then
+	if [ "$JSON" -eq 1 ]; then
+		printf '{"ok":false,"reason":"no-samples"}\n'
+	else
+		printf 'eve-bench: the hook produced no timed samples. Run the doctor first:\n  %s\n' \
+			"$EVE_HOME/bin/eve doctor" >&2
+	fi
+	exit 2
+fi
+
+R_P50=$(pct "$TMPD/real.ms" 0.50)
+R_P95=$(pct "$TMPD/real.ms" 0.95)
+set -- $(statline "$TMPD/real.ms")
+R_MIN=$1
+R_MAX=$2
+R_N=$3
+F_P50=$(pct "$TMPD/floor.ms" 0.50)
+F_P95=$(pct "$TMPD/floor.ms" 0.95)
+set -- $(statline "$TMPD/floor.ms")
+F_MIN=$1
+F_MAX=$2
+F_N=$3
+
+R_HITS=$(meta_get "$TMPD/real.meta" hits 0)
+R_TRUNC=$(meta_get "$TMPD/real.meta" truncated 0)
+F_TRUNC=$(meta_get "$TMPD/floor.meta" truncated 0)
+R_TIMEOUTS=$(meta_get "$TMPD/real.meta" timeouts 0)
+TRUNCATED=0
+[ "$R_TRUNC" = "1" ] || [ "$F_TRUNC" = "1" ] && TRUNCATED=1
+
+# An empty store is not a fast store.
+#
+# With no memories the hook exits at the `eve_store_ready` check before it
+# searches anything, so the "real" phase measures roughly nothing and would
+# otherwise be reported as a wonderfully fast system. Judge that case on the
+# floor instead -- the floor is a real measurement of this machine, and it is
+# the lower bound on what a prompt will cost the moment there is something to
+# find. Say all of that out loud rather than printing a 9 ms victory.
+EMPTY_STORE=0
+[ "$MEM_COUNT" -eq 0 ] && EMPTY_STORE=1
+
+if [ "$EMPTY_STORE" -eq 1 ]; then
+	SEARCH_MS=0
+	FLOOR_SHARE=1.00
+	FLOOR_PCT=100
+	JUDGED_MS=$F_P95
+else
+	# The split. Clamped at zero: on a small store the two phases are the same
+	# measurement twice and noise can put the floor above the real run.
+	# Reporting a negative search cost would be arithmetic pretending to be a
+	# finding.
+	SEARCH_MS=$((R_P50 - F_P50))
+	[ "$SEARCH_MS" -lt 0 ] && SEARCH_MS=0
+	FLOOR_SHARE=$(awk -v f="$F_P50" -v r="$R_P50" 'BEGIN { if (r <= 0) { print "0.00"; exit } s = f / r; if (s > 1) s = 1; printf "%.2f\n", s }')
+	FLOOR_PCT=$(awk -v s="$FLOOR_SHARE" 'BEGIN { printf "%d\n", s * 100 + 0.5 }')
+	JUDGED_MS=$R_P95
+fi
+
+# Verdict against the budget. Two thresholds, both stated: the budget itself,
+# and twice the budget as the point where this stops being a tuning question.
+if [ "$JUDGED_MS" -le "$BUDGET_MS" ]; then
+	VERDICT=comfortable
+elif [ "$JUDGED_MS" -le $((BUDGET_MS * 2)) ]; then
+	VERDICT=noticeable
+else
+	VERDICT=uninstall-territory
+fi
+
+# Which half of the cost is worth attacking. 60% is not a magic number; it is
+# the point past which the other half cannot be the main answer.
+if [ "$FLOOR_PCT" -ge 60 ]; then
+	DOMINANT=floor
+elif [ "$FLOOR_PCT" -le 40 ]; then
+	DOMINANT=search
+else
+	DOMINANT=mixed
+fi
+
+# --------------------------------------------------------------------------
+# The recommendation
+# --------------------------------------------------------------------------
+#
+# One specific next step, chosen by which half of the time is actually being
+# spent. "Your store is fine, the floor is your shell startup" is the common
+# answer on a small store and it is the useful one: pruning memories cannot
+# move a number that is 90% fork/exec.
+#
+# WHERE THESE LEVERS COME FROM. Each one was measured with this command before
+# it was recommended, on an Apple Silicon laptop with a warm cache. An estimate
+# in a recommendation is worse than no recommendation, because the reader spends
+# an afternoon on it.
+#
+#   jq. Present: floor p50 62 ms. Absent (so hooks/lib/common.sh falls through
+#   to python3 for the JSON parse): floor p50 102 ms. Same machine, same
+#   10-memory store, 12 runs each. 40 ms on every prompt, for one package.
+#
+#   EVE_CANDIDATE_CAP. NOT a lever, and it is the obvious wrong answer. On an
+#   8,000-memory store, dropping the cap from 300 to 20 -- a 15x cut -- moved
+#   p50 from 481 ms to 445 ms. Seven percent. The cap bounds what the SCORER
+#   reads, and by then `grep` has already read the whole store; timed on its
+#   own, the find|xargs grep prefilter was 0.45 s against 0.43 s for the entire
+#   search. The prefilter IS the search.
+#
+#   Total bytes. THE lever, because that is what the prefilter reads. Holding
+#   the file count at 2,000 and multiplying the bytes by 12.7 (3.2 MB -> 40 MB,
+#   1.7 KB files -> 19 KB files) took the search cost from 135 ms to 495 ms.
+#   File count matters too, but per byte it is the size of each memory that
+#   people actually control: a memory is supposed to be one claim.
+
+recommendation() {
+	if [ "$EMPTY_STORE" -eq 1 ]; then
+		printf 'Your store is empty, so the recall hook exits at the store-ready check in about %s ms and never searches anything. The number to plan around is the floor: %s ms at p95 on this machine, which is what a prompt will cost as soon as one memory exists. Write one: `eve add "your rule, stated as a claim"`, then run this again for a real measurement.' \
+			"$R_P50" "$F_P95"
+		return
+	fi
+	if [ "$VERDICT" = comfortable ] && [ "$DOMINANT" = floor ]; then
+		printf 'Nothing to do. Your store is not the cost -- %s%% of each prompt is fixed startup (shell, forks, config and JSON parsing) that would be there with five memories or five hundred. Write more memories; this number will barely move.' "$FLOOR_PCT"
+		return
+	fi
+	if [ "$VERDICT" = comfortable ]; then
+		printf 'Nothing to do. %s ms at p95 against a %s ms budget, with %s ms of that attributable to searching %s memories.' \
+			"$R_P95" "$BUDGET_MS" "$SEARCH_MS" "$MEM_COUNT"
+		return
+	fi
+	case "$DOMINANT" in
+	floor)
+		printf 'The store is not the problem: %s%% of the time is fixed overhead, so pruning memories will not help. Attack the floor.' "$FLOOR_PCT"
+		if [ "$HAVE_JQ" = no ]; then
+			printf ' Start with jq -- you do not have it, so every prompt parses its JSON with python3 instead. Measured on the author'"'"'s machine that swap alone was 40 ms per prompt (floor 62 ms with jq, 102 ms without). Install it and run this again.'
+		else
+			printf ' jq is already installed, so the cheap win is taken.'
+		fi
+		printf ' After that the candidates are environmental rather than configurable, and you find out by re-running this after changing one: is $EVE_HOME on an encrypted, network-mounted or spinning volume (move it to local disk); is there endpoint-security software inspecting every exec (this hook is about ten fork/exec pairs, so anything per-exec is multiplied by ten). If neither applies, this machine is simply slow at process creation and no amount of tuning inside Eve will change that; the remaining move is to ask for less work per prompt, EVE_RECALL_LIMIT=2.'
+		;;
+	search)
+		printf 'Your store is doing the work: %s ms of the %s ms p50 is search across %s memories (%s).' \
+			"$SEARCH_MS" "$R_P50" "$MEM_COUNT" "$(human_bytes "$STORE_BYTES")"
+		printf ' The lever is total bytes, because the cost is `grep` reading the whole store to build a candidate list. Measured: holding the file count fixed and multiplying the bytes by 12.7 took search from 135 ms to 495 ms.'
+		if [ "$LARGEST_BYTES" -ge 8192 ]; then
+			printf ' Your largest memory is %s, which is a document rather than a claim. Split it, and the ones like it; that is the cheapest bytes you will ever remove.' "$(human_bytes "$LARGEST_BYTES")"
+		else
+			printf ' Your files are already small (largest %s), so the bytes are coming from having %s of them. Measured on this same code at ~1.7 KB per file, search cost ran about 7 ms at 10 memories, 77 ms at 500, 143 ms at 2,000 and 369 ms at 8,000 -- so the number to move is the count. Archive what is no longer true; superseded memories still cost a grep.' \
+				"$(human_bytes "$LARGEST_BYTES")" "$MEM_COUNT"
+		fi
+		printf ' Do NOT bother lowering EVE_CANDIDATE_CAP (yours is %s). It bounds the scorer, which runs after grep has already read everything -- measured, cutting it 15x on an 8,000-memory store moved p50 by 7%%.' "$CFG_CANDCAP"
+		# Only mentioned if it is actually on this machine, and deliberately
+		# with no speed figure attached: this command has not measured that
+		# engine, and a number it did not take is exactly what it exists to
+		# stop people quoting. Re-running the bench is the measurement.
+		if [ -n "$ALT_ENGINE" ] && [ "$CFG_ENGINE" = awk ]; then
+			printf ' Structurally, a store this size is what the optional %s engine is for -- it replaces the grep-every-file step with an index. Your install has it (EVE_ENGINE=%s); switch, then run this again and compare, rather than taking anyone'"'"'s word for the gain.' \
+				"$ALT_ENGINE" "$ALT_ENGINE"
+		elif [ "$CFG_ENGINE" != awk ]; then
+			printf ' You are already on the %s engine, so this number is what that engine costs here.' "$CFG_ENGINE"
+		fi
+		;;
+	*)
+		printf 'The cost is split roughly evenly between fixed startup (%s ms) and search (%s ms), so neither alone explains it.' "$F_P50" "$SEARCH_MS"
+		if [ "$HAVE_JQ" = no ]; then
+			printf ' Take the cheap half first: install jq. Without it every prompt parses its JSON with python3, measured at 40 ms per prompt on the author'"'"'s machine.'
+		else
+			printf ' The startup half is already as cheap as configuration can make it (jq is installed).'
+		fi
+		printf ' For the search half the lever is total bytes read by grep, not EVE_CANDIDATE_CAP: trim or split your largest memories (biggest is %s) and re-run this to see whether it moved.' "$(human_bytes "$LARGEST_BYTES")"
+		;;
+	esac
+	if [ "$VERDICT" = uninstall-territory ]; then
+		# No number here on purpose. The disabled path is not one of the two
+		# phases this command times, so quoting a millisecond figure for it
+		# would be the exact thing this tool exists to stop: a performance claim
+		# that came from somewhere other than the measurement being reported.
+		# What IS checkable by reading eve-recall.sh is the structure.
+		printf ' Meanwhile `eve off` is the honest thing to do with a hook this slow: it sets EVE_DISABLE=1, and the hook then loads its config and exits before it reads the store or searches anything. It deletes nothing, and `eve on` puts it back.'
+	fi
+}
+
+RECOMMENDATION=$(recommendation)
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+json_str() { # STRING -> escaped, no surrounding quotes
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+if [ "$JSON" -eq 1 ]; then
+	printf '{'
+	printf '"ok":true,'
+	printf '"eve_home":"%s",' "$(json_str "$EVE_HOME")"
+	printf '"hook":"%s",' "$(json_str "$HOOK")"
+	printf '"clock":"%s",' "$CLOCK"
+	printf '"engine":"%s",' "$(json_str "$CFG_ENGINE")"
+	printf '"jq":%s,' "$([ "$HAVE_JQ" = yes ] && echo true || echo false)"
+	printf '"query":"%s",' "$(json_str "$QUERY")"
+	printf '"hit":%s,' "$([ "$R_HITS" -gt 0 ] && echo true || echo false)"
+	printf '"runs":%s,"warmup":%s,"samples":%s,' "$RUNS" "$WARMUP" "$R_N"
+	printf '"truncated":%s,' "$([ "$TRUNCATED" -eq 1 ] && echo true || echo false)"
+	printf '"timeouts":%s,' "$(intval "$R_TIMEOUTS" 0)"
+	printf '"store":{"memories":%s,"bytes":%s,"largest_bytes":%s,"candidate_cap":%s,"empty":%s},' \
+		"$MEM_COUNT" "$STORE_BYTES" "$LARGEST_BYTES" "$(intval "$CFG_CANDCAP" 300)" \
+		"$([ "$EMPTY_STORE" -eq 1 ] && echo true || echo false)"
+	printf '"recall_ms":{"p50":%s,"p95":%s,"min":%s,"max":%s,"n":%s},' \
+		"$R_P50" "$R_P95" "$R_MIN" "$R_MAX" "$R_N"
+	printf '"floor_ms":{"p50":%s,"p95":%s,"min":%s,"max":%s,"n":%s},' \
+		"$F_P50" "$F_P95" "$F_MIN" "$F_MAX" "$F_N"
+	printf '"search_ms":%s,"floor_share":%s,"dominant":"%s",' "$SEARCH_MS" "$FLOOR_SHARE" "$DOMINANT"
+	# judged_ms is the number the verdict was actually made on: recall p95
+	# normally, floor p95 when the store is empty and recall never ran.
+	printf '"budget_ms":%s,"judged_ms":%s,"verdict":"%s",' "$BUDGET_MS" "$JUDGED_MS" "$VERDICT"
+	printf '"recommendation":"%s"' "$(json_str "$RECOMMENDATION")"
+	printf '}\n'
+else
+	printf 'eve bench\n'
+	printf '  hook       %s\n' "$HOOK"
+	printf '  store      %s memories, %s' "$MEM_COUNT" "$(human_bytes "$STORE_BYTES")"
+	[ "$MEM_COUNT" -gt 0 ] && printf ', largest %s' "$(human_bytes "$LARGEST_BYTES")"
+	printf '\n'
+	printf '  engine     %s   jq: %s   clock: %s\n' "$CFG_ENGINE" "$HAVE_JQ" "$CLOCK"
+	if [ "$R_HITS" -gt 0 ]; then
+		printf '  query      "%s"  (hit)\n' "$QUERY"
+	elif [ "$EMPTY_STORE" -eq 1 ]; then
+		printf '  query      "%s"  (nothing to hit)\n' "$QUERY"
+	else
+		printf '  query      "%s"  (no hit -- see note below)\n' "$QUERY"
+	fi
+	printf '  runs       %s timed, %s warm-up discarded, per phase\n' "$R_N" "$WARMUP"
+	[ "$CFG_DISABLE" = "1" ] &&
+		printf '  note       EVE_DISABLE=1 in your config; bench forced it off so these\n             numbers are what recall costs when it is switched on\n'
+	[ "$TRUNCATED" -eq 1 ] &&
+		printf '  note       a phase hit the %ss deadline and was cut short; the numbers\n             below are from fewer samples than requested\n' "$DEADLINE"
+	[ "$(intval "$R_TIMEOUTS" 0)" -gt 0 ] &&
+		printf '  note       %s run(s) hit the per-run timeout and are recorded at the\n             timeout value, so the real p95 is worse than shown\n' "$R_TIMEOUTS"
+
+	printf '\n-- the real hook, against your store\n'
+	printf '  p50        %s ms\n' "$R_P50"
+	printf '  p95        %s ms\n' "$R_P95"
+	printf '  min / max  %s / %s ms\n' "$R_MIN" "$R_MAX"
+	[ "$EMPTY_STORE" -eq 1 ] &&
+		printf '             your store is empty, so this is the early-exit path: the hook\n             stops at the store-ready check and never searches. It is not a\n             measurement of recall, and the verdict below ignores it\n'
+
+	printf '\n-- the same hook, against a 1-memory store (the fixed floor)\n'
+	printf '  p50        %s ms\n' "$F_P50"
+	printf '  p95        %s ms\n' "$F_P95"
+
+	if [ "$EMPTY_STORE" -eq 1 ]; then
+		printf '\n-- where the time goes (at p50)\n'
+		printf '  floor      %4s ms  100%%  process startup, forks, config and JSON parse\n' "$F_P50"
+		printf '             there is no search cost to separate out yet. Write memories and\n'
+		printf '             run this again; the floor is the part that will not change\n'
+	else
+		printf '\n-- where the time goes (at p50)\n'
+		printf '  floor      %4s ms  %3s%%  process startup, forks, config and JSON parse\n' "$F_P50" "$FLOOR_PCT"
+		printf '  search     %4s ms  %3s%%  attributable to your %s memories\n' \
+			"$SEARCH_MS" "$((100 - FLOOR_PCT))" "$MEM_COUNT"
+		if [ "$SEARCH_MS" -eq 0 ] && [ "$(intval "$R_TIMEOUTS" 0)" -eq 0 ]; then
+			printf '             the two phases came out within noise of each other, which is\n'
+			printf '             the expected result on a small store: searching %s files is\n' "$MEM_COUNT"
+			printf '             lost against the cost of starting the processes that do it\n'
+		fi
+	fi
+
+	printf '\n-- verdict\n'
+	[ "$EMPTY_STORE" -eq 1 ] && printf '  (judged on the floor, since your store is empty)\n'
+	case "$VERDICT" in
+	comfortable)
+		printf '  COMFORTABLE. p95 %s ms, budget %s ms.\n' "$JUDGED_MS" "$BUDGET_MS" ;;
+	noticeable)
+		printf '  NOTICEABLE. p95 %s ms, over the %s ms budget.\n' "$JUDGED_MS" "$BUDGET_MS" ;;
+	*)
+		printf '  UNINSTALL TERRITORY. p95 %s ms, more than twice the %s ms budget.\n' "$JUDGED_MS" "$BUDGET_MS" ;;
+	esac
+	printf '\n'
+	printf '%s\n' "$RECOMMENDATION" | fold -s -w 74 | sed 's/^/  /'
+
+	printf '\n  The budget: this hook runs before every prompt and is pure overhead to\n'
+	printf '  you -- it buys nothing directly, only what the model does with the text\n'
+	printf '  it recalls. docs/03-hooks.md: a hook that adds a second to every prompt\n'
+	printf '  gets uninstalled.\n'
+	if [ "$BUDGET_MS" -eq 250 ]; then
+		printf '  250 ms is a quarter of that second, set where the cost is still only\n'
+		printf '  measurable rather than annoying, so it trips well before a user does.\n'
+	else
+		printf '  You asked for %s ms rather than the default 250, which is a quarter of\n' "$BUDGET_MS"
+		printf '  that second. Twice your budget (%s ms) is where this stops being a\n' "$((BUDGET_MS * 2))"
+		printf '  tuning question and starts being a reason to switch recall off.\n'
+	fi
+
+	if [ "$R_HITS" -eq 0 ] && [ "$EMPTY_STORE" -eq 0 ]; then
+		printf '\n  Note: the query returned nothing, so these numbers are the miss path,\n'
+		printf '  which is cheaper than a hit (no block to format, no dedupe write).\n'
+		printf '  Pass --query with something your store answers for a fair number.\n'
+	fi
+	# Say exactly which sample p95 is. "p95" over twenty runs sounds more
+	# authoritative than it is, and rounding it up to the slowest sample without
+	# saying so is the kind of quiet overstatement this whole command exists to
+	# stop doing.
+	P95_RANK=$(awk -v n="$R_N" 'BEGIN { i = int(0.95 * n + 0.999999); if (i < 1) i = 1; if (i > n) i = n; print i }')
+	P95_FROMTOP=$((R_N - P95_RANK + 1))
+	printf '\n  Percentiles are nearest-rank over %s samples: p95 is sample %s of %s by\n' "$R_N" "$P95_RANK" "$R_N"
+	if [ "$P95_FROMTOP" -le 1 ]; then
+		printf '  rank -- the slowest one. That is the weakest tail estimate this can give;\n'
+		printf '  raise --runs (20 or more) if the tail is what you care about.\n'
+	else
+		P95_ORD=$(awk -v n="$P95_FROMTOP" 'BEGIN {
+      t = n % 10; h = n % 100
+      s = "th"
+      if (t == 1 && h != 11) s = "st"
+      else if (t == 2 && h != 12) s = "nd"
+      else if (t == 3 && h != 13) s = "rd"
+      printf "%d%s\n", n, s
+    }')
+		printf '  rank, the %s slowest. That is a coarse tail. Raise --runs for a\n' "$P95_ORD"
+		printf '  better one.\n'
+	fi
+fi
+
+[ "$JUDGED_MS" -le "$BUDGET_MS" ] && exit 0
+exit 1
