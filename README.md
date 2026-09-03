@@ -1,5 +1,7 @@
 # Eve
 
+[![CI](https://github.com/Steve-CortesPineda/eve/actions/workflows/ci.yml/badge.svg)](https://github.com/Steve-CortesPineda/eve/actions/workflows/ci.yml)
+
 **Your coding agent starts every session knowing nothing about the last one.
 Eve is a small, boring, dependency-free way to fix that: a curated store of
 markdown files, retrieved automatically on every prompt.**
@@ -141,33 +143,14 @@ fiction.
 
 ## Install
 
-Three ways in. They install the same files and end at the same place.
-**[docs/11-install.md](docs/11-install.md) covers all three in full**, with
-uninstall paths and the gotchas.
-
 ```sh
-# Clone — canonical. Read the shell before you run it.
 git clone https://github.com/Steve-CortesPineda/eve.git && cd eve
 ./install.sh --dry-run     # the whole plan, writes nothing
 ./install.sh
-
-# npx — fastest. Two commands, deliberately.
-npx eve-recall init            # installs to ~/.eve; touches nothing in ~/.claude
-npx eve-recall install-hooks   # the opt-in step that wires the hooks
 ```
 
-```
-# Claude Code plugin — most native. Registers the hooks itself.
-/plugin marketplace add Steve-CortesPineda/eve
-/plugin install eve@eve-marketplace
-/eve-setup
-```
-
-| | Best when | The catch |
-|---|---|---|
-| **Clone** | You want to read it first. | You keep a clone and `git pull` to update. |
-| **npx** | You want it working in thirty seconds. | Needs node **to deliver the files only** — see below. |
-| **Plugin** | You are in Claude Code already. | GitHub shorthand clones over **SSH**; without a key it fails with an error that never says "SSH". Fix: `export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`, or pass the full `https://…` URL. |
+**[docs/11-install.md](docs/11-install.md) covers flags, uninstall, and
+gotchas in full.**
 
 **`eve` is not put on your PATH.** The installer writes the CLI to
 `~/.eve/bin/eve` and does not touch your shell startup file — that file is
@@ -187,26 +170,11 @@ exec $SHELL -l
 ```
 
 `./install.sh` prints whichever of those two you still need, with the exact
-line and the exact file for your shell, and checks PATH before it does.
-
-**npm is a delivery channel, not a runtime.** The package ships the same shell
-scripts the clone does plus a small dispatch shim. After `init`, what runs on
-every prompt is `sh` and `awk` under `~/.eve`, called by Claude Code directly —
-the shim is not in that path. Uninstall node afterwards and Eve keeps working.
-
-**Nothing is installed behind your back.** There is no `postinstall` script:
-`npm install eve-recall` writes into `node_modules` and stops. `init` creates
-`~/.eve` and touches neither `settings.json` nor `CLAUDE.md`; wiring the hooks
+line and the exact file for your shell, and checks PATH before it does. wiring the hooks
 is a separate command you have to type. Verify rather than believe it:
 
-```sh
-npm view eve-recall scripts dependencies   # both empty
-npx eve-recall print-hooks                 # prints the JSON, writes nothing
-```
-
-Uninstalling never deletes a memory: `./uninstall.sh`, `npx eve-recall
-uninstall`, or `/plugin uninstall eve@eve-marketplace`. The store at `~/.eve`
-is yours to remove, and only by hand.
+Uninstalling never deletes a memory: `./uninstall.sh` removes the wiring.
+The store at `~/.eve` is yours to remove, and only by hand.
 
 Not supported on native Windows — it is POSIX shell. It runs unchanged under
 WSL; install from inside the WSL shell.

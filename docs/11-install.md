@@ -1,13 +1,15 @@
 # 11 · Installing
 
-Three ways in. They install the same files and end at the same place: Eve's
-scripts under `~/.eve`, and three hook entries pointing at them. Pick on how
-much you want to read before you run something.
+Two ways in. They install the same files and end at the same place: Eve's
+scripts under `~/.eve`, and three hook entries pointing at them. Pick based on
+how much you want to read before you run something.
+
+> **Note:** Previous versions of this document referenced `npx eve-recall`.
+> That package is not published on npm. Use the clone method below.
 
 | | Command | Best when | The catch |
 |---|---|---|---|
 | **Clone** | `git clone … && ./install.sh` | You want to read the shell before you run it. **Canonical.** | You keep a clone around, and update it yourself with `git pull`. |
-| **npx** | `npx eve-recall init` | You want it working in about thirty seconds. | Needs node — only to *deliver* the files. Nothing Eve runs afterwards is JavaScript. |
 | **Plugin** | `/plugin marketplace add …` | You are in Claude Code and want the native path, with hooks wired for you. | Clones over SSH by default; fails without a key. See [the gotcha](#the-plugin-ssh-gotcha). |
 
 **Recommendation: clone.** Not out of caution theatre — Eve's whole claim is
@@ -68,74 +70,6 @@ the clone, so nothing you wrote is at risk.
 ```sh
 ./uninstall.sh            # removes the three hook entries and the CLAUDE.md block
 rm -rf ~/.eve             # only if you also want the memories gone. Your call.
-```
-
----
-
-## 2 · npx (fastest)
-
-```sh
-npx eve-recall init            # installs into ~/.eve. Touches nothing in ~/.claude
-npx eve-recall install-hooks   # the opt-in: wires the hooks
-```
-
-Two commands, deliberately. **`init` does not touch Claude Code's
-configuration** — not `settings.json`, not `CLAUDE.md`. Everything it writes is
-under one directory you can delete with one `rm -rf`. Wiring the hooks is a
-second command you have to type, because a tool that rewrites your editor's
-config as a side effect of being installed is a tool you should stop trusting.
-
-For the same reason **the package has no `postinstall` script.** `npm install
-eve-recall` writes into `node_modules` and does nothing else. Check before you
-believe it:
-
-```sh
-npm view eve-recall scripts     # (empty)
-npm view eve-recall dependencies # (empty)
-```
-
-Read the hook block before accepting it:
-
-```sh
-npx eve-recall print-hooks     # prints the JSON, writes nothing
-```
-
-### node is a delivery channel, not a runtime
-
-The package ships the same shell scripts the clone does, plus a small `node`
-shim (`npm/cli.js`) that does nothing but dispatch to them. After `init`, the
-code that runs on every prompt is `sh` and `awk` under `~/.eve`, invoked by
-Claude Code directly. The shim is not in that path and is never called again.
-**Uninstall node afterwards and Eve keeps working** — which is the honest test
-of whether a dependency is real.
-
-The npm tarball omits `evals/` (the fixture store and scorers) and
-`CONTRIBUTING.md`. Those are for working *on* Eve, not with it; clone if you
-want them.
-
-### Everyday commands
-
-Once `init` has run, the CLI lives at `~/.eve/bin/eve` — put it on your `PATH`
-and drop the `npx`:
-
-```sh
-eve add "the claim, stated as a sentence"
-eve index
-eve search --query "..."
-eve doctor
-```
-
-`npx eve-recall <anything-else>` passes straight through to that same CLI. When
-`~/.eve/bin/eve` exists it is preferred over the copy inside the package, so
-what you get at the terminal is produced by the same binary the hook calls —
-two copies of a scorer is how you spend an afternoon debugging the one that is
-not running.
-
-**Uninstalling:**
-
-```sh
-npx eve-recall uninstall       # removes the wiring. Never deletes a memory
-rm -rf ~/.eve                  # only if you also want the memories gone
 ```
 
 ---
@@ -265,7 +199,7 @@ the tool for "why did that not come back".
 |---|---|
 | `memory store is empty` | Correct. The store starts empty on purpose — seeding it with the fictional examples would seed it with fiction. |
 | `cannot probe: no memories to find` | Same cause. The probe can only measure a store with something in it. |
-| `no settings.json` after `npx eve-recall init` | Correct. `init` is files-only. Run `install-hooks` when you want them. |
+| `no settings.json` after clone + `./install.sh --no-hooks` | Correct. `--no-hooks` is files-only. Run without that flag when you want them. |
 
 ---
 
