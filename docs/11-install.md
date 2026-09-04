@@ -15,12 +15,11 @@ how much you want to read before you run something.
 **Recommendation: clone.** Not out of caution theatre — Eve's whole claim is
 that you can read it. It is shell and awk, the retrieval engine is one file
 (`bin/eve`), and the reason to prefer the clone is that the claim is checkable
-in about ten minutes. The other two paths exist because that is not everyone's
+in about ten minutes. The plugin path exists because that is not everyone's
 first ten minutes.
 
-All three are equivalent afterwards. You can start with npx and switch to a
-clone later; the store is in a different directory from the code and neither
-installer touches it.
+Clone and plugin install the same files. The store lives in `~/.eve`, separate
+from the code, and neither installer touches existing memories.
 
 ---
 
@@ -29,7 +28,7 @@ installer touches it.
 | Required | `sh`, `awk`, `grep`, `sed`, `find`, `date`. Stock on macOS and every Linux. |
 |---|---|
 | Optional | `jq` (installer only; there is a paste fallback), `python3` (stdlib only, for `kb/` and as a JSON fallback in hooks). |
-| **Windows** | Not supported natively — this is POSIX shell. It runs unchanged under **WSL**; install from inside the WSL shell. The npm package declares `"os": ["!win32"]`, so `npm install` refuses on native Windows rather than installing something that cannot run. |
+| **Windows** | Not supported natively — this is POSIX shell. It runs unchanged under **WSL**; install from inside the WSL shell. |
 
 ---
 
