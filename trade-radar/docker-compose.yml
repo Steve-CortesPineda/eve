@@ -1,0 +1,20 @@
+# Always-on deploy for a small VPS, so alerts fire while your Mac sleeps.
+#   docker compose up -d --build
+services:
+  trade-radar:
+    build: .
+    image: trade-radar:latest
+    restart: unless-stopped
+    env_file:
+      - .env            # your secrets (Telegram token, etc.); never committed
+    environment:
+      - DB_URL=sqlite:////data/trade_radar.db
+      - CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro   # edit watchlist/holdings without rebuild
+      - trade-radar-data:/data              # persist the SQLite headline/alert log
+    ports:
+      - "8000:8000"
+
+volumes:
+  trade-radar-data:

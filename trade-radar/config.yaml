@@ -1,0 +1,93 @@
+# Trade Radar configuration (non-secret). Secrets live in .env (see .env.example).
+# Times shown in the UI/alerts are always ET + KST.
+
+watchlist: [NQ, ES, TNX, VIX, DXY, BRENT]
+
+holdings:
+  - ticker: TSLA
+    type: shares
+    qty: 100
+    entry: 372.00
+  - ticker: GOOGL
+    type: shares
+    qty: 50
+    entry: 168.00
+
+# Per-ticker aliases (for matching) and flip levels (for price rules, M3).
+tickers:
+  TSLA:
+    aliases: [Tesla, Musk, Optimus, FSD, "Full Self-Driving", Cybercab, Robotaxi, Semi, Roadster]
+    flip_levels: [375.70]
+  GOOGL:
+    aliases: [Alphabet, Google, Gemini, Waymo, Cloud, DeepMind, Suncatcher]
+    flip_levels: [168.00]
+  NQ:
+    aliases: [Nasdaq, "Nasdaq 100", NQ]
+  ES:
+    aliases: ["S&P 500", "S&P500", ES]
+  TNX:
+    aliases: ["10-year", "10Y", "Treasury yield", "10-year yield"]
+  VIX:
+    aliases: [VIX, volatility]
+  DXY:
+    aliases: [dollar index, DXY]
+  BRENT:
+    aliases: [Brent, "Brent crude", oil]
+
+# Starter risk keywords for the keyword fast-path (case-insensitive, word-boundary).
+risk_keywords:
+  - "report says"
+  - "The Information"
+  - "Bloomberg reports"
+  - "Reuters reports"
+  - delay
+  - postpone
+  - snag
+  - probe
+  - investigation
+  - recall
+  - NHTSA
+  - SEC
+  - DOJ
+  - FTC
+  - EU
+  - ban
+  - tariff
+  - downgrade
+  - "cuts price target"
+  - halt
+  - lawsuit
+  - guidance
+  - misses
+  - warns
+  - resigns
+  - "force majeure"
+  - outage
+
+news:
+  poll_seconds: 45  # jittered; never faster than 30s per feed
+  google_news_queries:
+    - query: "Tesla OR TSLA"
+      tickers: [TSLA]
+    - query: "Tesla Optimus"
+      tickers: [TSLA]
+    - query: "Tesla FSD OR Full Self-Driving"
+      tickers: [TSLA]
+    - query: "Alphabet OR Google OR GOOGL"
+      tickers: [GOOGL]
+    - query: "Waymo"
+      tickers: [GOOGL]
+  investing_rss:
+    - "https://www.investing.com/rss/news_25.rss"
+
+thresholds:
+  fuzzy_ratio: 85
+  dedupe_window_minutes: 120
+  fastpath_min_severity_push: 3
+  urgent_severity: 4
+
+quiet_hours:
+  enabled: false
+  start: "22:00"   # KST
+  end: "07:00"     # KST
+  mute_holdings: false   # P0 holding alerts are never muted unless this is true
